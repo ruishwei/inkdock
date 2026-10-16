@@ -35,8 +35,34 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
+      - name: Locate Android SDK tools
+        shell: bash
+        run: |
+          # GitHub images may provide an SDK without sdkmanager on PATH.
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          if [[ ! -d "$SDK_ROOT" ]]; then SDK_ROOT="$RUNNER_TEMP/android-sdk"; fi
+          SDKMANAGER="$(command -v sdkmanager || true)"
+          if [[ -z "$SDKMANAGER" && -d "$SDK_ROOT/cmdline-tools" ]]; then
+            SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -path '*/bin/sdkmanager' | sort -V | tail -n 1)"
+          fi
+          if [[ -z "$SDKMANAGER" ]]; then
+            # Official Google package; pin and verify the published SHA-256.
+            ARCHIVE="$RUNNER_TEMP/android-commandlinetools.zip"
+            curl --fail --location --retry 3 https://dl.google.com/android/repository/commandlinetools-linux-15859902_latest.zip --output "$ARCHIVE"
+            echo "4e4c464f145a7512b57d088ac6c278c03c9eea610886b35a5e0804e74eedf583  $ARCHIVE" | sha256sum --check --strict
+            mkdir -p "$SDK_ROOT/cmdline-tools"
+            unzip -q "$ARCHIVE" -d "$RUNNER_TEMP/android-commandlinetools"
+            mv "$RUNNER_TEMP/android-commandlinetools/cmdline-tools" "$SDK_ROOT/cmdline-tools/15859902"
+            SDKMANAGER="$SDK_ROOT/cmdline-tools/15859902/bin/sdkmanager"
+          fi
+          test -x "$SDKMANAGER"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+          "$SDKMANAGER" --version
       - name: Install Android platform
-        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+        # Use runner's existing SDK licenses; do not silently accept new terms.
+        run: sdkmanager --sdk_root="$ANDROID_HOME" 'platforms;android-35' 'build-tools;35.0.0' </dev/null
       - run: gradle --no-daemon :app:assembleDebug :app:lintDebug
       - uses: actions/upload-artifact@v4
         with:
