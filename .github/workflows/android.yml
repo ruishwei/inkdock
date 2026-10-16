@@ -1,0 +1,66 @@
+name: Android debug
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: 'Optional prerelease version, e.g. v0.1.0-alpha.1'
+        required: false
+        default: ''
+        type: string
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --ignore-scripts && npm run vendor && git diff --exit-code -- app/src/main/assets/vendor && npm test
+      - run: npx playwright-core install --with-deps chromium
+      - run: node scripts/browser-smoke.cjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: InkDock-browser-screenshots
+          path: build/screenshots/
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+      - name: Install Android platform
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - run: gradle --no-daemon :app:assembleDebug :app:lintDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: InkDock-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+  release:
+    if: github.event_name == 'workflow_dispatch' && inputs.release_version != ''
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: InkDock-debug-apk
+          path: release
+      - name: Publish preview
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.release_version }}
+        run: |
+          [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+$ ]] || { echo 'Invalid preview version'; exit 1; }
+          mv release/app-debug.apk release/InkDock-debug.apk
+          (cd release && sha256sum InkDock-debug.apk > SHA256SUMS.txt)
+          gh release create "$VERSION" release/InkDock-debug.apk release/SHA256SUMS.txt --target "$GITHUB_SHA" --prerelease --title "InkDock $VERSION" --notes-file docs/release-notes.md
