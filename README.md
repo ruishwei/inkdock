@@ -1,3 +1,7 @@
+# 系统文件预缓冲实验（未发布）
+
+本分支使用synthesizeToFile和私有临时音频两槽预准备；不是仅QUEUE_ADD排队。代码/主机测试通过，Android平台性能待验证。无原生Kokoro JNI，不覆盖main正式预览。见docs/bounded-speech-prefetch.md。
+
 # InkDock
 
 轻量、开源、离线优先的 Android Markdown + LaTeX 阅读器。第一版面向 Vivo Y300t / Android 15；离线阅读不需要账号，不申请广泛存储权限。可选实验性云语音需要用户自己的服务商账号/API key，并使用网络权限。代码采用 MIT 许可。
