@@ -7,6 +7,7 @@ import org.inkdock.reader.BackgroundReaderTestSupport.assertRemains
 import org.inkdock.reader.BackgroundReaderTestSupport.await
 import org.inkdock.reader.BackgroundReaderTestSupport.js
 import org.inkdock.reader.BackgroundReaderTestSupport.onMain
+import org.inkdock.reader.BackgroundReaderTestSupport.returnReaderToForeground
 import org.inkdock.reader.BackgroundReaderTestSupport.systemHome
 import org.inkdock.reader.BackgroundReaderTestSupport.withReader
 import org.junit.Assert.*
@@ -49,7 +50,7 @@ class CloudBackgroundConsentDeviceTest {
                     onMain { dialog(cloud) == null && field(cloud, "active") == false }
                         .also { assertNoSynthesis(cloud) }
                 }
-                scenario.moveToState(Lifecycle.State.RESUMED)
+                returnReaderToForeground(scenario, activity)
                 await("Reader restored after Home") { onMain { activity.hasWindowFocus() } }
                 assertEquals("true", js(web, "window.__backgroundCloudEvents.every(e=>e.phase!=='queued' && e.phase!=='started')"))
                 assertNull(onMain { dialog(cloud) })

@@ -19,6 +19,7 @@ import org.inkdock.reader.BackgroundReaderTestSupport.await
 import org.inkdock.reader.BackgroundReaderTestSupport.instrumentation
 import org.inkdock.reader.BackgroundReaderTestSupport.js
 import org.inkdock.reader.BackgroundReaderTestSupport.onMain
+import org.inkdock.reader.BackgroundReaderTestSupport.returnReaderToForeground
 import org.inkdock.reader.BackgroundReaderTestSupport.systemHome
 import org.inkdock.reader.BackgroundReaderTestSupport.sleepScreen
 import org.inkdock.reader.BackgroundReaderTestSupport.wakeScreen
@@ -85,7 +86,7 @@ class OfflineSpeechBackgroundDeviceTest {
             wakeScreen()
             await("Screen wakes after lock-screen Stop") { power.isInteractive }
             onMain { web.resumeTimers() }
-            scenario.moveToState(Lifecycle.State.RESUMED)
+            returnReaderToForeground(scenario, activity)
             await("Reader is foreground again") { onMain { activity.hasWindowFocus() } }
             js(web, "window.onOfflineQueueStatus=window.__originalOfflineStatus;window.onSpeechStatus=window.__originalSpeechStatus;Native.getSpeechState();true")
             await("Stopped snapshot restores reader controls") {

@@ -7,6 +7,7 @@ import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.WebView
+import androidx.lifecycle.Lifecycle
 import androidx.test.core.app.ActivityScenario
 import androidx.test.platform.app.InstrumentationRegistry
 import org.json.JSONObject
@@ -44,6 +45,20 @@ internal object BackgroundReaderTestSupport {
                     current.Bridge().stopSpeaking()
                 }
             }
+        }
+    }
+
+    fun returnReaderToForeground(scenario: ActivityScenario<MainActivity>, original: MainActivity) {
+        // Home changes Android task focus. moveToState(RESUMED) cannot bring that task back.
+        // Reorder the existing Activity instead of launching a replacement or replaying a share.
+        val component = original.componentName.flattenToString()
+        val result = shell("am start -W --activity-reorder-to-front --activity-single-top -n $component")
+        assertTrue("Android could not bring reader task forward: $result", !result.contains("Error:"))
+        await("Original reader resumes after actual task foregrounding") {
+            scenario.state == Lifecycle.State.RESUMED && onMain { !original.isDestroyed && original.hasWindowFocus() }
+        }
+        scenario.onActivity { current ->
+            assertTrue("Task foregrounding must retain the original Activity", current === original)
         }
     }
 
