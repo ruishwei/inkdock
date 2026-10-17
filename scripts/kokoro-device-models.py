@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -139,6 +140,8 @@ class Device:
         require(serial == "emulator-5554", "Only the dedicated emulator-5554 is supported")
         require(os.environ.get("INKDOCK_EPHEMERAL_DEVICE_TEST") == "1", "Staging/collection is restricted to the explicit disposable CI emulator run")
         self.command = ["adb", "-s", serial]
+        require("shell_v2" in self.text("features").strip().split(","),
+                "ADB shell_v2 is required for binary stdin EOF and remote exit status")
         require(self.text("shell", "getprop", "ro.kernel.qemu").strip() == "1", "Refusing a physical device")
         require(self.text("shell", "getprop", "ro.build.version.sdk").strip() == "35", "Expected Android API 35")
         require(self.text("shell", "getprop", "ro.product.cpu.abi").strip() == "x86_64", "Expected x86_64 emulator")
@@ -151,10 +154,34 @@ class Device:
         return self.text("shell", "run-as", PACKAGE, *arguments)
 
     def write(self, remote, stream):
-        # No shell interpolation or shared-storage staging. Toybox dd reads stdin
-        # straight into the debug app's private, generated staging directory.
-        subprocess.run([*self.command, "exec-in", "run-as", PACKAGE, "dd", "of=" + remote],
-                       stdin=stream, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=240, check=True)
+        require(re.fullmatch(r"files/neural-models/\.kokoro-zh-v1_1-(?:float|int8)-ci-staging/[A-Za-z0-9_.-]+", remote)
+                and Path(remote).name not in (".", ".."), "Unsafe private staging destination")
+        # exec-in closes after copying host stdin, without waiting for dd or
+        # returning its exit status. shell_v2 sends explicit stdin EOF and waits
+        # for the remote exit packet. -T avoids PTY byte translation; -e none
+        # disables escape handling. Every argument is fixed or allowlisted above.
+        # The model still goes directly into app-private storage, never /sdcard
+        # or /data/local/tmp. AOSP: packages/modules/adb/client/commandline.cpp.
+        result = subprocess.run([*self.command, "shell", "-T", "-e", "none", "run-as", PACKAGE,
+                                 "dd", "of=" + remote, "bs=1048576"],
+                                stdin=stream, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=240)
+        require(result.returncode == 0,
+                f"Private transfer failed: {Path(remote).name} remote_exit={result.returncode} "
+                f"stderr={result.stderr.decode('utf-8', errors='replace')[-2000:]!r}")
+
+
+def verify_private_file(device, remote, expected_bytes, expected_sha256):
+    # Query both values even if one differs: public filenames, byte counts and
+    # hashes are safe diagnostics, and distinguish truncation from corruption.
+    sizes = device.private("wc", "-c", remote).split()
+    digests = device.private("sha256sum", remote).split()
+    actual_bytes = sizes[0] if sizes and re.fullmatch(r"[0-9]+", sizes[0]) else "invalid"
+    actual_sha256 = digests[0] if digests and re.fullmatch(r"[a-f0-9]{64}", digests[0]) else "invalid"
+    detail = (f"{Path(remote).name} expected_bytes={expected_bytes} actual_bytes={actual_bytes} "
+              f"expected_sha256={expected_sha256} actual_sha256={actual_sha256}")
+    print("Private device file integrity:", detail, flush=True)
+    require(actual_bytes == str(expected_bytes) and actual_sha256 == expected_sha256,
+            "Device model integrity mismatch: " + detail)
 
 
 def stage(cache, serial):
@@ -175,13 +202,13 @@ def stage(cache, serial):
             remote = staging + "/" + record["name"]
             with model_path(cache, record).open("rb") as stream:
                 device.write(remote, stream)
-            require(device.private("sha256sum", remote).split()[0] == record["sha256"], "Device model checksum mismatch")
-            require(int(device.private("wc", "-c", remote).split()[0]) == record["bytes"], "Device model size mismatch")
-        marker = "\n".join(record["name"] + " " + record["sha256"] for record in variants[variant])
+            verify_private_file(device, remote, record["bytes"], record["sha256"])
+        marker = "\n".join(record["name"] + " " + record["sha256"] for record in variants[variant]).encode()
         with tempfile.TemporaryFile() as stream:
-            stream.write(marker.encode())
+            stream.write(marker)
             stream.seek(0)
             device.write(staging + "/VERIFIED", stream)
+        verify_private_file(device, staging + "/VERIFIED", len(marker), hashlib.sha256(marker).hexdigest())
         device.private("rm", "-rf", directory)
         device.private("mv", staging, directory)
         print("Verified private emulator model:", variant, flush=True)
@@ -261,6 +288,73 @@ def instrumentation_report(log, output, exit_code):
     print("All six expected native instrumentation tests passed with no skipped tests")
 
 
+def transfer_self_test(directory):
+    """Use a local fake adb process, never an emulator or model download."""
+    import contextlib
+    import io
+    from unittest.mock import patch
+
+    directory = Path(directory)
+    remote = "files/neural-models/.kokoro-zh-v1_1-float-ci-staging/model.onnx"
+    captured = directory / "captured-binary"
+    fake_adb = directory / "fake-adb.py"
+    expected_args = ["shell", "-T", "-e", "none", "run-as", PACKAGE, "dd", "of=" + remote, "bs=1048576"]
+    fake_adb.write_text("import pathlib, sys, time\n"
+                        + "assert sys.argv[1:] == " + repr(expected_args) + "\n"
+                        + "data = sys.stdin.buffer.read()\n"
+                        + "time.sleep(0.05)  # The caller must wait for remote completion.\n"
+                        + "pathlib.Path(" + repr(str(captured)) + ").write_bytes(data)\n")
+    device = Device.__new__(Device)
+    device.command = [sys.executable, str(fake_adb)]
+    binary = bytes(range(256)) * 4096 + b"\x00\r\n~.\n~\x04\xff"
+    with tempfile.TemporaryFile() as stream:
+        stream.write(binary)
+        stream.seek(0)
+        device.write(remote, stream)
+    require(captured.read_bytes() == binary, "Binary transfer did not await byte-exact completion")
+    checks = 1
+    fake_adb.write_text("import sys\nsys.stdin.buffer.read()\nsys.stderr.write('dd: input/output error')\nsys.exit(7)\n")
+    with tempfile.TemporaryFile() as stream:
+        try:
+            device.write(remote, stream)
+        except RuntimeError as error:
+            require("remote_exit=7" in str(error) and "input/output error" in str(error), "Remote transfer failure diagnostic missing")
+            checks += 1
+        else:
+            raise AssertionError("Ignored nonzero remote dd status")
+        for unsafe in (remote + ";touch_bad", remote.rsplit("/", 1)[0] + "/..", "/data/local/tmp/model.onnx"):
+            try:
+                device.write(unsafe, stream)
+            except RuntimeError as error:
+                require("Unsafe private staging" in str(error), "Unsafe path reached adb")
+                checks += 1
+            else:
+                raise AssertionError("Accepted unsafe staging path")
+    with patch.dict(os.environ, {"INKDOCK_EPHEMERAL_DEVICE_TEST": "1"}), patch.object(Device, "text", return_value="cmd,stat_v2"):
+        try:
+            Device("emulator-5554")
+        except RuntimeError as error:
+            require("shell_v2" in str(error), "Unexpected missing-feature error")
+            checks += 1
+        else:
+            raise AssertionError("Accepted missing remote exit protocol")
+    expected_sha = hashlib.sha256(binary).hexdigest()
+    with patch.object(device, "private", side_effect=[str(len(binary)), expected_sha]), contextlib.redirect_stdout(io.StringIO()):
+        verify_private_file(device, remote, len(binary), expected_sha)
+        checks += 1
+    for size, digest in ((str(len(binary) - 1), expected_sha), (str(len(binary)), "0" * 64), ("bad size", "bad digest")):
+        with patch.object(device, "private", side_effect=[size, digest]), contextlib.redirect_stdout(io.StringIO()):
+            try:
+                verify_private_file(device, remote, len(binary), expected_sha)
+            except RuntimeError as error:
+                require(all(field in str(error) for field in ("model.onnx", "expected_bytes=", "actual_bytes=", "expected_sha256=", "actual_sha256=")),
+                        "Integrity error lacks expected/actual diagnostics")
+                checks += 1
+            else:
+                raise AssertionError("Accepted corrupt device model")
+    return checks
+
+
 def self_test():
     text = MANIFEST.read_text()
     variants = parse_manifest(text)
@@ -282,6 +376,7 @@ def self_test():
         else:
             raise AssertionError("Accepted unsafe or changed model manifest")
     with tempfile.TemporaryDirectory() as directory:
+        checks += transfer_self_test(directory)
         path = Path(directory) / "fixture"
         path.write_bytes(b"fixed")
         record = {"bytes": 5, "sha256": hashlib.sha256(b"fixed").hexdigest()}
@@ -309,7 +404,7 @@ def self_test():
                 checks += 1
             else:
                 raise AssertionError("Accepted incomplete/failed instrumentation")
-    print(f"Passed {checks} offline model/cache/instrumentation checks; no download or device used")
+    print(f"Passed {checks} offline model/cache/transfer/instrumentation checks; no download or device used")
 
 
 def main():
