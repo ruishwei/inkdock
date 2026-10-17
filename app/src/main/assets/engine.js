@@ -16,5 +16,12 @@
     const chunks=[];for(let start=0;start<blocks.length;start+=batchSize)chunks.push({start,end:Math.min(start+batchSize,blocks.length)});
     return {blocks,headings,chunks,links:tokens.links};
   }
-  const api={indexDocument};if(typeof module==='object')module.exports=api;else root.InkEngine=api;
+  // Global heading predecessor: handles lazy groups beginning in an earlier section.
+  function headingAtBlock(headings,block){
+    if(!Number.isInteger(block)||block<0)return null;
+    let lo=0,hi=headings.length;
+    while(lo<hi){const mid=(lo+hi)>>>1;if(headings[mid].block<=block)lo=mid+1;else hi=mid;}
+    return lo?headings[lo-1]:null;
+  }
+  const api={indexDocument,headingAtBlock};if(typeof module==='object')module.exports=api;else root.InkEngine=api;
 })(typeof globalThis==='object'?globalThis:this);

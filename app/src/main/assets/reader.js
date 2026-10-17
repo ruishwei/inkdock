@@ -17,15 +17,41 @@ function render(target=0,locate=false){
   const renderedTarget=current,renderedBook=book;
   requestAnimationFrame(()=>{if(book!==renderedBook||page!==Math.floor(renderedTarget/40))return;document.getElementById(book.blocks[renderedTarget]?.id)?.scrollIntoView(locate?{block:'center'}:undefined);persist();});
 }
+// TOC location follows browsing, never the queued/audible speech anchor.
+let tocEntries=new Map(),selectedToc=null;
+function viewportBlock(){
+ const sections=[...$('content').children];
+ const visible=sections.find(el=>el.getBoundingClientRect().bottom>16)||sections.at(-1);
+ return visible?Number(visible.dataset.index):null;
+}
+function updateViewportProgress(){
+ const index=viewportBlock();
+ if(index!==null&&Number.isInteger(index)){current=index;persist();}
+}
+function syncTocLocation(reveal=false){
+ const index=viewportBlock(),heading=index===null?null:InkEngine.headingAtBlock(book.headings,index);
+ if(selectedToc)selectedToc.title.removeAttribute('aria-current');
+ selectedToc=heading?tocEntries.get(heading.block):null;
+ if(selectedToc)selectedToc.title.setAttribute('aria-current','location');
+ if(!reveal)return;
+ // Reset unrelated branches; opening the panel reveals only the selected path.
+ const ancestors=new Set();for(let node=selectedToc?.parent;node;node=node.parent)ancestors.add(node);
+ for(const node of tocEntries.values())if(node.children){node.children.hidden=!ancestors.has(node);node.update();}
+ const panel=$('tocPanel');
+ if(!selectedToc){panel.scrollTop=0;return;}
+ // Scroll only the fixed panel. Element.scrollIntoView can also move the body.
+ const bounds=panel.getBoundingClientRect(),row=selectedToc.row.getBoundingClientRect();
+ if(row.top<bounds.top+16||row.bottom>bounds.bottom-16)panel.scrollTop+=row.top-bounds.top-(bounds.height-row.height)/2;
+}
 function buildToc(){
- $('toc').replaceChildren();const roots=[],stack=[];
- for(const h of book.headings){const node={...h,children:[]};while(stack.length&&stack.at(-1).level>=h.level)stack.pop();(stack.length?stack.at(-1).children:roots).push(node);stack.push(node);}
+ $('toc').replaceChildren();tocEntries=new Map();selectedToc=null;const roots=[],stack=[];
+ for(const h of book.headings){const node={...h,nodes:[],parent:null};while(stack.length&&stack.at(-1).level>=h.level)stack.pop();node.parent=stack.at(-1)||null;(node.parent?node.parent.nodes:roots).push(node);stack.push(node);}
  function append(nodes,parent){for(const h of nodes){
-  const wrapper=document.createElement('div'),row=document.createElement('div');row.className='toc-row';
-  const title=document.createElement('button');title.className='toc-title';title.textContent=h.title;title.onclick=()=>{cancelReading();closePanels();render(h.block);};
-  if(h.children.length){const arrow=document.createElement('button'),children=document.createElement('div');arrow.className='toc-toggle';children.className='toc-children';children.id='toc-children-'+h.block;children.hidden=h.level>2;
-   function update(){arrow.textContent=children.hidden?'›':'⌄';arrow.setAttribute('aria-expanded',String(!children.hidden));arrow.setAttribute('aria-label',(children.hidden?'展开':'收起')+h.title);}
-   arrow.setAttribute('aria-controls',children.id);arrow.onclick=()=>{children.hidden=!children.hidden;update();};update();row.append(arrow,title);wrapper.append(row,children);append(h.children,children);
+  const wrapper=document.createElement('div'),row=document.createElement('div');row.className='toc-row';h.row=row;
+  const title=document.createElement('button');title.className='toc-title';title.textContent=h.title;title.dataset.block=h.block;h.title=title;tocEntries.set(h.block,h);title.onclick=()=>{cancelReading();closePanels();render(h.block);};
+  if(h.nodes.length){const arrow=document.createElement('button'),children=document.createElement('div');arrow.className='toc-toggle';children.className='toc-children';children.id='toc-children-'+h.block;children.hidden=true;h.children=children;
+   function update(){arrow.textContent=children.hidden?'›':'⌄';arrow.setAttribute('aria-expanded',String(!children.hidden));arrow.setAttribute('aria-label',(children.hidden?'展开':'收起')+title.textContent);}
+   h.update=update;arrow.setAttribute('aria-controls',children.id);arrow.onclick=()=>{children.hidden=!children.hidden;update();};update();row.append(arrow,title);wrapper.append(row,children);append(h.nodes,children);
   }else{const spacer=document.createElement('span');spacer.className='toc-spacer';row.append(spacer,title);wrapper.append(row);}
   parent.append(wrapper);
  }}
@@ -33,7 +59,7 @@ function buildToc(){
 }
 function persist(){if(bridge)bridge.saveProgress(current,size,document.body.classList.contains('dark'));}
 window.loadDocument=(text,anchor=0,font=20,dark=false,preserveNative=false)=>{if(!preserveNative)cancelReading();clearReadingLocation();readingStatus('');book=InkEngine.indexDocument(text);size=Math.max(14,Math.min(32,font));$('content').style.fontSize=`${size}px`;document.body.classList.toggle('dark',dark);$('theme').textContent=dark?'日间模式':'夜间模式';buildToc();render(anchor);};
-$('open').onclick=()=>{cancelReading();closePanels();bridge?.openDocument();};$('tocButton').onclick=()=>openPanel('tocPanel');
+$('open').onclick=()=>{cancelReading();closePanels();bridge?.openDocument();};$('tocButton').onclick=()=>{updateViewportProgress();openPanel('tocPanel');syncTocLocation(true);};
 $('prev').onclick=()=>render(Math.max(0,(page-1)*40));$('next').onclick=()=>render(Math.min(book.blocks.length-1,(page+1)*40));
 $('smaller').onclick=()=>{closePanels();size=Math.max(14,size-2);$('content').style.fontSize=`${size}px`;persist();};
 $('larger').onclick=()=>{closePanels();size=Math.min(32,size+2);$('content').style.fontSize=`${size}px`;persist();};
@@ -126,7 +152,7 @@ window.onSpeechStatus=event=>{
  else if(event.phase==='done'&&job){job.part++;setTimeout(()=>{if(reading===job)sendReadingPart();},120);}
  else{if(event.phase==='error'||event.phase==='stopped')reading=null;clearReadingLocation();updatePlayButton(false);}
 };
-window.addEventListener('scroll',()=>{clearTimeout(saveTimer);saveTimer=setTimeout(()=>{const sections=[...$('content').children];const visible=sections.find(el=>el.getBoundingClientRect().bottom>16);if(visible){current=Number(visible.dataset.index);persist();}},200);});
+window.addEventListener('scroll',()=>{clearTimeout(saveTimer);saveTimer=setTimeout(()=>{updateViewportProgress();if(!$('tocPanel').hidden)syncTocLocation();},200);});
 function showToolbar(visible){
  $('toolbar').classList.toggle('is-hidden',!visible);$('toolbar').inert=!visible;
  $('toolbar').setAttribute('aria-hidden',String(!visible));

@@ -5,3 +5,7 @@
 .sleep-timer-panel{top:auto;max-height:calc(100dvh - var(--tools-height) - 32px)}.timer-presets{display:flex;gap:8px}.timer-presets button{flex:1}.timer-custom{display:flex;gap:10px;margin-bottom:16px}.timer-custom input{min-width:0;flex:1;min-height:44px;font:inherit;padding:8px;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px}#sleepTimerStatus{font-size:24px;font-variant-numeric:tabular-nums}#sleepTimerError{color:#b33b30}.dark #sleepTimerError{color:#ffaaa0}#cancelSleepTimer{width:100%}
 /* Paragraph-level playback marker; no word-timing precision is implied. */
 #content .speaking{outline:2px solid #638653;outline-offset:3px}.dark #content .speaking{outline-color:#83aa88}
+
+/* Current browsing section, distinct from the paragraph playback marker. */
+.toc-title[aria-current="location"]{font-weight:700;background:#d9e5ee;box-shadow:inset 4px 0 #35607f}.dark .toc-title[aria-current="location"]{background:#253d50;box-shadow:inset 4px 0 #93bddc}
+#tocPanel{overscroll-behavior:contain}
