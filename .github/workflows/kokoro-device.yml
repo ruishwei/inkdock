@@ -1,4 +1,4 @@
-name: Kokoro buffered Android device experiment
+name: Kokoro streaming Android device experiment
 
 on:
   workflow_dispatch:
@@ -203,7 +203,7 @@ jobs:
           "$ANDROID_HOME/emulator/emulator" -version > build/kokoro-device/reports/emulator-version.txt
       - name: Download and hash-check only fixed public float/int8 model files
         run: python3 scripts/kokoro-device-models.py download
-      - name: Run real JNI, buffered playback and float callback latency on disposable API 35
+      - name: Run real JNI, bounded streaming and float callback latency on disposable API 35
         timeout-minutes: 40
         env:
           INKDOCK_EPHEMERAL_DEVICE_TEST: '1'
@@ -261,7 +261,7 @@ jobs:
           # Explicit new test classes only. No cloud provider/test credentials/user text.
           set +e
           timeout 1800 adb -s emulator-5554 shell am instrument -w -r \
-            -e class org.inkdock.reader.KokoroNativeDeviceTest,org.inkdock.reader.KokoroModelTransferDeviceTest,org.inkdock.reader.NativePcmPrefetchDeviceTest,org.inkdock.reader.KokoroFloatLatencyBenchmarkDeviceTest \
+            -e class org.inkdock.reader.KokoroNativeDeviceTest,org.inkdock.reader.KokoroModelTransferDeviceTest,org.inkdock.reader.NativePcmPrefetchDeviceTest,org.inkdock.reader.KokoroFloatLatencyBenchmarkDeviceTest,org.inkdock.reader.KokoroStreamingDeviceTest \
             -e kokoroVariants float,int8 \
             org.inkdock.reader.test/androidx.test.runner.AndroidJUnitRunner 2>&1 | tee "$REPORTS/instrumentation.txt"
           INSTRUMENTATION_EXIT=${PIPESTATUS[0]}
@@ -286,7 +286,7 @@ jobs:
       - name: Preserve current-source experimental debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: InkDock-kokoro-buffer-device-apk-${{ github.run_id }}
+          name: InkDock-kokoro-streaming-device-apk-${{ github.run_id }}
           path: |
             app/build/outputs/apk/debug/app-debug.apk
             build/kokoro-device/reports/SHA256SUMS.txt
