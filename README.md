@@ -4,7 +4,7 @@
 
 > 当前为早期预览。Android 编译结果见 [Actions](https://github.com/ruishwei/inkdock/actions)，安装包见 [Releases](https://github.com/ruishwei/inkdock/releases)。尚未经过 Vivo Y300t 真机验证。
 
-## 当前功能（alpha.3）
+## 当前功能（alpha.4）
 
 - 系统文件选择器与 Android「分享」导入 UTF-8 Markdown / 文本（上限 8 MiB）
 - KaTeX 脚本、样式和全部字体随 APK 打包；断网也能显示 `$...$`、`$$...$$`、`\(...\)` 与 `\[...\]`
@@ -49,18 +49,26 @@ git diff --exit-code -- app/src/main/assets/vendor
 
 版本：Android Gradle Plugin 8.9.2、Kotlin 2.1.20；JS 依赖的精确版本及完整性见 `package.json` / `package-lock.json`，许可证随 `assets/vendor` 一同分发。应用 UI 没有远程资源；系统 WebView 与 TTS 由 Android 提供。
 
+## 返回与语音排查（alpha.4）
+
+系统返回先关闭目录、更多或声音弹层，再次返回才离开阅读器。Android 13–15 使用原生 Back 回调，旧系统有兼容处理。
+
+语音区分「请求已排队」「引擎报告开始」「完成」「错误」。入队成功不等于手机已经出声。失败会显示具体错误并提示，声音设置可查看本次会话诊断（仅状态、字符数、耗时和错误码，不含正文）；若引擎快速报告完成却无声音，请检查媒体音量、蓝牙输出、系统 TTS 语音包与离线音色。没有 LLM / 云 TTS 配置，本应用尚未接入云语音。
+
+CI 运行 Android 15 模拟器的原生 Back 回归和语音状态机测试；模拟器结果不能代替 Vivo Y300t 真机音频验证。
+
 ## 安全边界与限制
 
 - Manifest 没有 INTERNET 权限；WebView 禁止网络请求，只允许应用自带资产。导入 HTML 按文字显示，渲染结果经 DOMPurify 清洗；外链导航、图片和表单禁用。KaTeX `trust:false`。
 - 文档源码、索引仍整体保存在内存；仅 DOM 渲染分组，不是流式文件读取或无限虚拟滚动。极大的单个表格/代码块仍可能卡顿。8 MiB 是保护上限，不是低内存设备性能保证。
 - 只保留一份当前文档副本。重新导入相同内容可恢复旧锚点；修改内容会被视作新文档。没有书架、全文搜索、手工书签或导出进度。
-- 预览版不会自动连续朗读；播放中按钮明确变为「停止」，不是暂停，重播从当前段落起读。公式语音不是专门的数学朗读。按系统引擎的离线/已安装标记筛选音色，不请求在线音色或下载。系统 TTS 是独立服务，其实现由设备供应商决定；音色情感和自然度不能靠切换语言保证。当前只选择系统默认引擎中的音色，不在应用内更换引擎。
+- 支持从当前正文段连续往后朗读并高亮，选中文字只读所选部分。标题、纯公式与代码块跳过；长段分片不截断尾部。播放中按钮明确变为「停止」，不是暂停，重播从当前段落起读。公式语音不是专门的数学朗读。按系统引擎的离线/已安装标记筛选音色，不请求在线音色或下载。系统 TTS 是独立服务，其实现由设备供应商决定；音色情感和自然度不能靠切换语言保证。当前只选择系统默认引擎中的音色，不在应用内更换引擎。
 - Markdown/KaTeX 不等于完整 TeX；不支持宏包、外部资源或任意 HTML。现代 JavaScript 要求较新的 Android System WebView；主要验证目标为 Android 15。
 - 不支持 EPUB/PDF、图片、云同步。没有分析埋点。
 
 ## 发布
 
-GitHub Actions 在 push/PR 时测试并构建 debug APK。维护者可在 `Android debug` 的 `Run workflow` 输入 `release_version`（如 `v0.1.0-alpha.3`）；构建成功后使用临时 GITHUB_TOKEN 发布 prerelease、APK 与 SHA256，无需持久密钥。
+GitHub Actions 在 push/PR 时测试并构建 debug APK。维护者可在 `Android debug` 的 `Run workflow` 输入 `release_version`（如 `v0.1.0-alpha.4`）；构建成功后使用临时 GITHUB_TOKEN 发布 prerelease、APK 与 SHA256，无需持久密钥。
 
 ## English
 
