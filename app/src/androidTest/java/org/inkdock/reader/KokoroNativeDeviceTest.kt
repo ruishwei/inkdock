@@ -132,7 +132,7 @@ class KokoroNativeDeviceTest {
                         onMain { speech.voiceSettings().let { !it.getBoolean("loading") && it.getBoolean("initialized") } }
                     }
                     assertTrue(onMain { speech.voiceSettings().getBoolean("engineBindingVerified") })
-                    assertEquals("native-pcm-prefetch", onMain { speech.stateSnapshot().getString("bufferingMode") })
+                    assertEquals("native-pcm-stream-prefetch", onMain { speech.stateSnapshot().getString("bufferingMode") })
                     assertTrue(onMain { speech.configureVoice("Kokoro-zf_001-003", 1f) })
                     val began = SystemClock.elapsedRealtime()
                     onMain { speech.submitQueue(request("real-native-synthetic", listOf("这是一段公开的合成测试文字，请安静地读完。", NEXT_TEXT, TEXT)), "synthetic-native-only") }
