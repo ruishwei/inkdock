@@ -7,9 +7,10 @@ import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.WebView
-import androidx.lifecycle.Lifecycle
 import androidx.test.core.app.ActivityScenario
 import androidx.test.platform.app.InstrumentationRegistry
+import androidx.test.runner.lifecycle.ActivityLifecycleMonitorRegistry
+import androidx.test.runner.lifecycle.Stage
 import org.json.JSONObject
 import org.junit.Assert.assertTrue
 import java.util.concurrent.CountDownLatch
@@ -50,16 +51,33 @@ internal object BackgroundReaderTestSupport {
 
     fun returnReaderToForeground(scenario: ActivityScenario<MainActivity>, original: MainActivity) {
         // Home changes Android task focus. moveToState(RESUMED) cannot bring that task back.
-        // Reorder the existing Activity instead of launching a replacement or replaying a share.
+        // Preserve MAIN/LAUNCHER: MainActivity stores onNewIntent(), and ActivityScenario
+        // ignores subsequent lifecycle events if the Activity's intent filter no longer matches.
+        // This helper returns only launcher-started test Activities, never a share/file import.
+        assertTrue("Foreground helper supports launcher intents only", onMain {
+            original.intent.action == Intent.ACTION_MAIN && original.intent.hasCategory(Intent.CATEGORY_LAUNCHER)
+        })
         val component = original.componentName.flattenToString()
-        val result = shell("am start -W --activity-reorder-to-front --activity-single-top -n $component")
+        val result = shell("am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER --activity-reorder-to-front --activity-single-top -n $component")
         assertTrue("Android could not bring reader task forward: $result", !result.contains("Error:"))
-        await("Original reader resumes after actual task foregrounding") {
-            scenario.state == Lifecycle.State.RESUMED && onMain { !original.isDestroyed && original.hasWindowFocus() }
+        await("Original reader resumes after matching launcher task foregrounding") {
+            readerIsResumed(original)
         }
         scenario.onActivity { current ->
             assertTrue("Task foregrounding must retain the original Activity", current === original)
         }
+    }
+
+    // ActivityScenario.state throws during legitimate STARTED/RESTARTED transitions.
+    // The platform monitor exposes these stages directly so polling does not fail mid-transition.
+    fun readerIsResumed(activity: MainActivity): Boolean = onMain {
+        ActivityLifecycleMonitorRegistry.getInstance().getLifecycleStageOf(activity) == Stage.RESUMED &&
+            !activity.isDestroyed && activity.hasWindowFocus()
+    }
+
+    fun readerIsStopped(activity: MainActivity): Boolean = onMain {
+        ActivityLifecycleMonitorRegistry.getInstance().getLifecycleStageOf(activity) == Stage.STOPPED &&
+            !activity.isDestroyed && !activity.hasWindowFocus()
     }
 
     fun systemHome() = shell("input keyevent 3")

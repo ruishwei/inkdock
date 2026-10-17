@@ -13,12 +13,12 @@ import android.os.PowerManager
 import android.webkit.WebView
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
-import androidx.lifecycle.Lifecycle
 import org.inkdock.reader.BackgroundReaderTestSupport.assertRemains
 import org.inkdock.reader.BackgroundReaderTestSupport.await
 import org.inkdock.reader.BackgroundReaderTestSupport.instrumentation
 import org.inkdock.reader.BackgroundReaderTestSupport.js
 import org.inkdock.reader.BackgroundReaderTestSupport.onMain
+import org.inkdock.reader.BackgroundReaderTestSupport.readerIsStopped
 import org.inkdock.reader.BackgroundReaderTestSupport.returnReaderToForeground
 import org.inkdock.reader.BackgroundReaderTestSupport.systemHome
 import org.inkdock.reader.BackgroundReaderTestSupport.sleepScreen
@@ -55,7 +55,7 @@ class OfflineSpeechBackgroundDeviceTest {
             onMain { web.pauseTimers() }
             systemHome()
             await("Actual Home backgrounds reader") {
-                scenario.state != Lifecycle.State.RESUMED && onMain { !activity.hasWindowFocus() }
+                readerIsStopped(activity)
             }
             sleepScreen()
             await("Platform screen is actually off") { !power.isInteractive }
@@ -67,7 +67,7 @@ class OfflineSpeechBackgroundDeviceTest {
                 assertTrue("Native queue ended before crossing background segments: $current", current.optBoolean("active"))
                 current.optString("phase") == "started" && current.optInt("queueIndex") >= firstBackgroundIndex + 3
             }
-            assertTrue("Reader must remain in background", scenario.state != Lifecycle.State.RESUMED)
+            assertTrue("Reader must remain in background", readerIsStopped(activity))
             val foreground = notification()
             assertTrue("Playing notification must represent a foreground Service", foreground.flags and Notification.FLAG_FOREGROUND_SERVICE != 0)
             assertEquals("transport", foreground.category)
@@ -100,7 +100,7 @@ class OfflineSpeechBackgroundDeviceTest {
             await("Silent fixture playback begins") { state(service).optString("phase") == "started" }
             systemHome()
             await("Home backgrounds reader before notification control") {
-                scenario.state != Lifecycle.State.RESUMED && onMain { !activity.hasWindowFocus() }
+                readerIsStopped(activity)
             }
             notificationAction("暂停").actionIntent.send()
             await("Notification Pause reaches native state") { state(service).optString("phase") == "paused" }
@@ -117,7 +117,7 @@ class OfflineSpeechBackgroundDeviceTest {
             await("Resumed queue advances in background", 15_000) {
                 state(service).let { it.optBoolean("active") && it.optInt("queueIndex") > index }
             }
-            assertTrue("Notification controls must not bring reader forward", scenario.state != Lifecycle.State.RESUMED)
+            assertTrue("Notification controls must not bring reader forward", readerIsStopped(activity))
             notificationAction("停止").actionIntent.send()
             await("Resumed playback stops") { !state(service).optBoolean("active") && !hasNotification() }
         }

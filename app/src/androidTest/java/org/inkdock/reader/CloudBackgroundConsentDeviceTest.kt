@@ -2,11 +2,11 @@ package org.inkdock.reader
 
 import android.app.AlertDialog
 import androidx.test.ext.junit.runners.AndroidJUnit4
-import androidx.lifecycle.Lifecycle
 import org.inkdock.reader.BackgroundReaderTestSupport.assertRemains
 import org.inkdock.reader.BackgroundReaderTestSupport.await
 import org.inkdock.reader.BackgroundReaderTestSupport.js
 import org.inkdock.reader.BackgroundReaderTestSupport.onMain
+import org.inkdock.reader.BackgroundReaderTestSupport.readerIsStopped
 import org.inkdock.reader.BackgroundReaderTestSupport.returnReaderToForeground
 import org.inkdock.reader.BackgroundReaderTestSupport.systemHome
 import org.inkdock.reader.BackgroundReaderTestSupport.withReader
@@ -39,7 +39,7 @@ class CloudBackgroundConsentDeviceTest {
                 // Actual platform Home dispatch, not a call to Activity.onPause or the JS handler.
                 systemHome()
                 await("Reader leaves foreground after Home") {
-                    scenario.state != Lifecycle.State.RESUMED && onMain { !activity.hasWindowFocus() }
+                    readerIsStopped(activity)
                 }
                 await("Consent dismissed on background transition") { onMain { !unapproved.isShowing && dialog(cloud) == null } }
                 assertNoSynthesis(cloud)
