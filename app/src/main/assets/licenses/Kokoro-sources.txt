@@ -1,0 +1,15 @@
+InkDock own code: MIT (unchanged).
+Experimental inference runtime: sherpa-onnx upstream PR 4055, commit 0586cd8e14d7eae56e52ae0f1fd7b947e74b84f7, Apache-2.0.
+https://github.com/k2-fsa/sherpa-onnx/pull/4055
+Kokoro model: hexgrad/Kokoro-82M-v1.1-zh, Apache-2.0.
+https://huggingface.co/hexgrad/Kokoro-82M-v1.1-zh
+Converted int8 artifact and Chinese lexicon: https://huggingface.co/csukuangfj/kokoro-int8-multi-lang-v1_1/tree/155831f1b4ba23b1f5c058be6a61df90cefb2a37
+Chinese lexicon generation: sherpa scripts/kokoro/v1.1-zh/generate_lexicon_zh.py using Misaki (Apache-2.0) and python-pinyin (MIT).
+ONNX Runtime: Microsoft MIT, accompanying third-party notices copied by builder.
+Other upstream CMake dependencies retain Apache-2.0, BSD-3-Clause, MIT, MPL-2.0 notices in kokoro-native directory.
+Eigen source (unmodified headers, MPL-2.0): https://gitlab.com/libeigen/eigen/-/tree/5.0.1
+No eSpeak-NG code or data is downloaded into this app. No Piper-phonemize linkage is used.
+This experiment does not bundle VoxSherpa or any third-party GPL app code.
+
+Float ONNX: https://huggingface.co/csukuangfj/kokoro-multi-lang-v1_1/tree/914313412b607d95400bcd12446233fbd1248801
+Float and int8 variants use the same Apache-2.0 model license.
