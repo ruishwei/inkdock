@@ -34,6 +34,7 @@ REVISIONS = {
 ARTIFACTS = (
     "float-speaker-3.wav", "float-speaker-53.wav", "int8-speaker-3.wav", "int8-speaker-53.wav",
     "real-model-metrics.json", "synthetic-prefetch-metrics.json", "float-latency-benchmark.json", "streaming-device-metrics.json",
+    "sleep-timer-device-metrics.jsonl",
 )
 
 EXPECTED_TESTS = {
@@ -48,7 +49,14 @@ EXPECTED_TESTS = {
     ("org.inkdock.reader.KokoroStreamingDeviceTest", "screenOffNotificationStopCancelsCurrentStreamAndQueuedNextWithoutRestart"),
     ("org.inkdock.reader.KokoroStreamingDeviceTest", "syntheticProducerStarvationDoesNotBecomeEofOrPrematureDone"),
     ("org.inkdock.reader.KokoroStreamingDeviceTest", "syntheticQueuedNextRingCanFillPromoteAndCancelWithoutLeakingSlots"),
+    ("org.inkdock.reader.SleepTimerDeviceTest", "foregroundPausedTimerExpiresAfterRealMinute"),
+    ("org.inkdock.reader.SleepTimerDeviceTest", "homeTimerExpiresAfterRealMinute"),
+    ("org.inkdock.reader.SleepTimerDeviceTest", "screenOffTimerExpiresAfterRealMinute"),
+    ("org.inkdock.reader.SleepTimerDeviceTest", "cancelReplaceAndManualStopRespectDeadline"),
+    ("org.inkdock.reader.SleepTimerDeviceTest", "recreationAndServiceRestartDoNotAutoResume"),
+    ("org.inkdock.reader.SleepTimerDeviceTest", "pendingCloudConsentExpiresWithoutSynthesis"),
 }
+TIMER_METHODS = {method for cls, method in EXPECTED_TESTS if cls == "org.inkdock.reader.SleepTimerDeviceTest"}
 
 
 def require(condition, message):
@@ -242,6 +250,8 @@ def collect(output, serial, require_all):
             with temporary.open("rb") as stream:
                 header = stream.read(12)
             require(header[:4] == b"RIFF" and header[8:12] == b"WAVE", "Expected WAV artifact")
+        elif name.endswith(".jsonl"):
+            read_json_lines(temporary)
         else:
             json.loads(temporary.read_text())
         target = output / name
@@ -291,6 +301,44 @@ def verify_metric_reports(output):
                         "Float benchmark callback/returned PCM comparison failed or was not completed")
     streaming = json.loads((output / "streaming-device-metrics.json").read_text())
     verify_streaming_report(streaming)
+    verify_timer_report(read_json_lines(output / "sleep-timer-device-metrics.jsonl"))
+
+
+def read_json_lines(path):
+    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    require(rows and all(isinstance(row, dict) for row in rows), "Expected nonempty timer JSONL object records")
+    return rows
+
+
+def verify_timer_report(rows):
+    require(len(rows) == len(TIMER_METHODS) and {row.get("test") for row in rows} == TIMER_METHODS,
+            "Sleep timer metrics must contain exactly one final record for each of the six expected methods")
+    by_test = {row["test"]: row for row in rows}
+    for row in rows:
+        require(row.get("passed") is True and row.get("timingBasis") == "SystemClock.elapsedRealtime_real_device",
+                "Sleep timer test failed, is incomplete, or lacks real-device clock evidence: " + row["test"])
+        require(row.get("activeQueue") is False and row.get("resourcesReleased") is True,
+                "Sleep timer test left active playback/resources: " + row["test"])
+    for method, surface in (("foregroundPausedTimerExpiresAfterRealMinute", "foreground"),
+                            ("homeTimerExpiresAfterRealMinute", "background"),
+                            ("screenOffTimerExpiresAfterRealMinute", "screen_off"),
+                            ("pendingCloudConsentExpiresWithoutSynthesis", "cloud_pending_consent")):
+        row = by_test[method]
+        require(row.get("durationMinutes") == 1 and row.get("requestedMs") == 60_000
+                and row.get("surface") == surface and row.get("expired") is True,
+                "Real one-minute sleep timer surface/expiry evidence is missing: " + method)
+        elapsed = row.get("elapsedMs")
+        require(type(elapsed) in (int, float) and math.isfinite(elapsed) and elapsed >= 60_000,
+                "Sleep timer test did not observe a complete real 60-second interval: " + method)
+        armed, observed = row.get("armedElapsedRealtimeMs"), row.get("observedExpiryElapsedRealtimeMs")
+        require(type(armed) is int and type(observed) is int and armed >= 0 and observed - armed == elapsed,
+                "Sleep timer real-clock timestamp evidence is inconsistent: " + method)
+        require(row.get("bufferedSlots") == 0 and row.get("retainedAudioBuffers") == 0,
+                "Expired sleep timer retained playback slots: " + method)
+        if surface in ("background", "screen_off"):
+            require(row.get("activityStoppedAtExpiry") is True, "Sleep timer did not expire after actual Activity STOPPED")
+        if surface == "screen_off":
+            require(row.get("screenOffAtExpiry") is True, "Sleep timer did not expire while the display was actually off")
 
 
 def verify_streaming_report(streaming):
@@ -467,11 +515,26 @@ def metric_self_test(directory):
             "synthetic_next": {"passed": True, "syntheticProducer": True, "realAudioTrack": True,
                 "promotionExactRingInputMatch": True, "promotionMaxSlots": 2, "cancelMaxSlots": 2, "slotsAfterCancel": 0},
         },
+        "sleep-timer-device-metrics.jsonl": [
+            {"test": method, "passed": True, "timingBasis": "SystemClock.elapsedRealtime_real_device",
+             "durationMinutes": 1, "elapsedMs": 60_001, "expired": True,
+             "requestedMs": 60_000, "armedElapsedRealtimeMs": 100_000, "observedExpiryElapsedRealtimeMs": 160_001,
+             "activeQueue": False, "resourcesReleased": True,
+             "bufferedSlots": 0, "retainedAudioBuffers": 0,
+             "activityStoppedAtExpiry": method in ("homeTimerExpiresAfterRealMinute", "screenOffTimerExpiresAfterRealMinute"),
+             "screenOffAtExpiry": method == "screenOffTimerExpiresAfterRealMinute",
+             "surface": {"foregroundPausedTimerExpiresAfterRealMinute": "foreground",
+                         "homeTimerExpiresAfterRealMinute": "background",
+                         "screenOffTimerExpiresAfterRealMinute": "screen_off",
+                         "pendingCloudConsentExpiresWithoutSynthesis": "cloud_pending_consent"}.get(method, "control")}
+            for method in sorted(TIMER_METHODS)
+        ],
     }
 
     def write_reports(values):
         for name, report in values.items():
-            (output / name).write_text(json.dumps(report))
+            text = "".join(json.dumps(row) + "\n" for row in report) if name.endswith(".jsonl") else json.dumps(report)
+            (output / name).write_text(text)
 
     write_reports(reports)
     verify_metric_reports(output)
@@ -509,6 +572,24 @@ def metric_self_test(directory):
         ("streaming-device-metrics.json", ("synthetic_next", "cancelMaxSlots"), 1),
         ("streaming-device-metrics.json", ("synthetic_next", "slotsAfterCancel"), 1),
     ]
+    timer_rows = reports["sleep-timer-device-metrics.jsonl"]
+    for index, row in enumerate(timer_rows):
+        mutations.append(("sleep-timer-device-metrics.jsonl", (index, "passed"), False))
+        if row["surface"] in ("foreground", "background", "screen_off", "cloud_pending_consent"):
+            for field, replacement in (("elapsedMs", 59_999), ("expired", False),
+                                       ("surface", "fake"), ("timingBasis", "fake_clock"),
+                                       ("requestedMs", 59_999), ("observedExpiryElapsedRealtimeMs", 159_999),
+                                       ("retainedAudioBuffers", 1)):
+                mutations.append(("sleep-timer-device-metrics.jsonl", (index, field), replacement))
+        if row["surface"] in ("background", "screen_off"):
+            mutations.append(("sleep-timer-device-metrics.jsonl", (index, "activityStoppedAtExpiry"), False))
+        if row["surface"] == "screen_off":
+            mutations.append(("sleep-timer-device-metrics.jsonl", (index, "screenOffAtExpiry"), False))
+    mutations.extend([
+        ("sleep-timer-device-metrics.jsonl", (0, "test"), "unexpectedTimerTest"),
+        ("sleep-timer-device-metrics.jsonl", (0, "activeQueue"), True),
+        ("sleep-timer-device-metrics.jsonl", (0, "resourcesReleased"), False),
+    ])
     for name, path, replacement in mutations:
         altered = copy.deepcopy(reports)
         target = altered[name]
@@ -522,7 +603,7 @@ def metric_self_test(directory):
             checks += 1
         else:
             raise AssertionError("Accepted incomplete metric report: " + str(path))
-    for name in ("float-latency-benchmark.json", "streaming-device-metrics.json"):
+    for name in ("float-latency-benchmark.json", "streaming-device-metrics.json", "sleep-timer-device-metrics.jsonl"):
         write_reports(reports)
         (output / name).unlink()
         try:
@@ -531,6 +612,22 @@ def metric_self_test(directory):
             checks += 1
         else:
             raise AssertionError("Accepted missing mandatory report: " + name)
+    timer_file = output / "sleep-timer-device-metrics.jsonl"
+    for malformed in ("", "[]\n", "{not valid json}\n"):
+        timer_file.write_text(malformed)
+        try:
+            read_json_lines(timer_file)
+        except (RuntimeError, ValueError):
+            checks += 1
+        else:
+            raise AssertionError("Accepted malformed timer JSONL")
+    for incomplete in (timer_rows[:-1], [timer_rows[0]] * len(timer_rows)):
+        try:
+            verify_timer_report(incomplete)
+        except RuntimeError:
+            checks += 1
+        else:
+            raise AssertionError("Accepted missing/duplicate timer metrics")
     return checks
 
 
@@ -577,6 +674,10 @@ def self_test():
         without_streaming = "".join("INSTRUMENTATION_STATUS: class=" + cls + "\nINSTRUMENTATION_STATUS: test=" + method
                                     + "\nINSTRUMENTATION_STATUS_CODE: 0\n" for cls, method in prior_tests)
         without_streaming += f"OK ({len(prior_tests)} tests)\nINSTRUMENTATION_CODE: -1\n"
+        prior_native_tests = [(cls, method) for cls, method in sorted(EXPECTED_TESTS) if not cls.endswith("SleepTimerDeviceTest")]
+        without_timer = "".join("INSTRUMENTATION_STATUS: class=" + cls + "\nINSTRUMENTATION_STATUS: test=" + method
+                                + "\nINSTRUMENTATION_STATUS_CODE: 0\n" for cls, method in prior_native_tests)
+        without_timer += f"OK ({len(prior_native_tests)} tests)\nINSTRUMENTATION_CODE: -1\n"
         log.write_text(passing)
         instrumentation_report(log, report, 0)
         checks += 1
@@ -587,6 +688,7 @@ def self_test():
                                    (passing.replace("INSTRUMENTATION_CODE: -1", ""), 0),
                                    (without_benchmark, 0),
                                    (without_streaming, 0),
+                                   (without_timer, 0),
                                    (passing, 124)):
             log.write_text(altered)
             try:

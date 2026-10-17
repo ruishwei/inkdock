@@ -1,0 +1,21 @@
+const {chromium}=require('playwright-core');
+const assert=require('node:assert/strict');const path=require('node:path');const fs=require('node:fs');
+(async()=>{const browser=await chromium.launch({executablePath:process.env.CHROMIUM_PATH||'/usr/bin/chromium',headless:true,args:['--no-sandbox']});try{
+ const page=await browser.newPage({viewport:{width:360,height:800}});const errors=[];page.on('pageerror',e=>errors.push(e.message));
+ await page.addInitScript(()=>{window.calls=[];window.Native={ready(){},panelState(open){calls.push(['panel',open]);},saveProgress(){},stopSpeaking(){},getSleepTimer(){},setSleepTimer(minutes){calls.push(['timer',minutes]);window.onSleepTimerStatus({active:true,remainingMs:minutes*60000});},cancelSleepTimer(){calls.push(['cancel']);window.onSleepTimerStatus({active:false});}};});
+ await page.goto('file://'+path.resolve(__dirname,'../app/src/main/assets/index.html'));
+ await page.evaluate(()=>{loadDocument('# 夜读\n\n这是用于界面测试的示例文字。打开睡眠定时，安心继续阅读。',0,20,false);setVoiceSettings({source:'offline',voices:[],engines:[]});});
+ assert.equal(await page.locator('#toolbar button').count(),3);
+ await page.click('#moreButton');await page.click('#sleepTimerSettings');assert.equal(await page.locator('#morePanel').isVisible(),false);
+ await page.click('#sleep30');assert.equal(await page.locator('#sleepTimerStatus').textContent(),'剩余 30:00');
+ await page.fill('#sleepMinutes','0');await page.click('#startSleepTimer');assert.equal(await page.locator('#sleepTimerError').isVisible(),true);
+ await page.fill('#sleepMinutes','45');await page.click('#startSleepTimer');assert.equal(await page.locator('#sleepTimerStatus').textContent(),'剩余 45:00');
+ const overflow=await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth);assert.equal(overflow,false);
+ fs.mkdirSync('build/screenshots',{recursive:true});await page.screenshot({path:'build/screenshots/09-sleep-timer-mobile.png'});
+ await page.click('#cancelSleepTimer');assert.equal(await page.locator('#cancelSleepTimer').isDisabled(),true);
+ await page.evaluate(()=>onSleepTimerStatus({active:false,expired:true}));assert.match(await page.locator('#sleepTimerStatus').textContent(),/已停止/);
+ await page.keyboard.press('Escape');assert.equal(await page.locator('#sleepTimerPanel').isVisible(),false);
+ await page.click('#moreButton');await page.click('#sleepTimerSettings');await page.click('#closeSleepTimer');assert.equal(await page.locator('#sleepTimerPanel').isVisible(),false);
+ await page.evaluate(()=>document.body.classList.add('dark'));await page.click('#moreButton');await page.click('#sleepTimerSettings');await page.click('#sleep15');await page.screenshot({path:'build/screenshots/10-sleep-timer-dark.png'});
+ assert.deepEqual(errors,[]);console.log('PASS: mobile 360px timer panel, compact 3-icon toolbar, presets/custom/validation/cancel, expiry display, repeated Close/Escape and dark theme. Native mocked, no audio/network.');
+ }finally{await browser.close();}})().catch(e=>{console.error(e);process.exitCode=1;});
