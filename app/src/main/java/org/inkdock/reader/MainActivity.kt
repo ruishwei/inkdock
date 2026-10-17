@@ -5,6 +5,12 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.util.Log
+import android.window.OnBackInvokedCallback
+import android.window.OnBackInvokedDispatcher
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.view.View
@@ -33,11 +39,16 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     private lateinit var root: FrameLayout
     private var appliedDark: Boolean? = null
     private var speechSequence = 0
-    private var activeUtterance: String? = null
+    private val speech = SpeechTracker()
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val speechDiagnostics = ArrayDeque<String>()
+    private var panelOpen = false
+    private var backCallback: OnBackInvokedCallback? = null
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private var ttsInitialized = false
     private var ready = false
+    private var foreground = false
     private var text = ""
     private var documentId = "sample"
     private var importGeneration = 0
@@ -107,13 +118,62 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
                 else window.decorView.systemUiVisibility or lightIcons
         }
     }
-    private fun playbackState(playing: Boolean) {
-        if (ready && !isDestroyed) web.evaluateJavascript("window.setPlaybackState($playing)", null)
+    private fun setPanelOpen(open: Boolean) {
+        panelOpen = open
+        if (Build.VERSION.SDK_INT >= 33) {
+            if (open && backCallback == null) {
+                val callback = OnBackInvokedCallback { closePanelFromBack() }
+                backCallback = callback
+                onBackInvokedDispatcher.registerOnBackInvokedCallback(OnBackInvokedDispatcher.PRIORITY_DEFAULT, callback)
+            } else if (!open) {
+                backCallback?.let { onBackInvokedDispatcher.unregisterOnBackInvokedCallback(it) }
+                backCallback = null
+            }
+        }
     }
-    private fun stopPlayback() {
-        activeUtterance = null
+    private fun closePanelFromBack() {
+        if (!ready || isDestroyed) return
+        web.evaluateJavascript("window.handleNativeBack ? window.handleNativeBack() : false", null)
+    }
+    @Deprecated("Legacy Back fallback for Android 8–12")
+    override fun onBackPressed() {
+        if (panelOpen) closePanelFromBack() else super.onBackPressed()
+    }
+    private fun emitSpeech(update: SpeechTracker.Update, message: String = "") {
+        val event = JSONObject().put("requestId", update.requestId).put("phase", update.phase)
+            .put("characters", update.characters).put("elapsedMs", update.elapsedMs).put("message", message)
+            .put("errorCode", update.errorCode ?: JSONObject.NULL)
+        val line = "${update.phase} chars=${update.characters} elapsed=${update.elapsedMs}ms error=${update.errorCode ?: "none"}"
+        speechDiagnostics.addLast(line)
+        while (speechDiagnostics.size > 12) speechDiagnostics.removeFirst()
+        Log.i("InkDockTTS", line) // Never log document text or selection.
+        if (ready && !isDestroyed) web.evaluateJavascript("window.onSpeechStatus($event)", null)
+        if (update.phase == "error") toast(message)
+    }
+    private fun speechError(code: Int?): String = when (code) {
+        TextToSpeech.ERROR_NOT_INSTALLED_YET -> "语音包尚未安装完成，请在系统 TTS 设置检查离线中文语音包。"
+        TextToSpeech.ERROR_OUTPUT -> "语音输出失败，请检查媒体音量、蓝牙或音频设备。"
+        TextToSpeech.ERROR_SYNTHESIS -> "系统引擎合成失败，请换一个已安装的离线中文音色。"
+        TextToSpeech.ERROR_SERVICE -> "系统语音服务不可用，请检查 TTS 引擎或重启应用。"
+        TextToSpeech.ERROR_NETWORK, TextToSpeech.ERROR_NETWORK_TIMEOUT -> "引擎报告网络错误；本应用仅请求离线音色，请检查语音包是否真的可离线使用。"
+        TextToSpeech.ERROR_INVALID_REQUEST -> "系统语音引擎拒绝了朗读请求。"
+        -1000 -> "语音请求已提交，但12秒内没有收到开始回调。请检查系统 TTS 设置。"
+        else -> "语音引擎未能完成朗读（错误码 ${code ?: "未知"}），请在声音设置查看诊断。"
+    }
+    private fun speechEvent(id: String?, phase: String, code: Int? = null) {
+        val update = speech.event(id, phase, SystemClock.elapsedRealtime(), code) ?: return
+        val message = when (phase) {
+            "started" -> "引擎报告开始朗读；是否有声音仍取决于媒体音量和输出设备。"
+            "done" -> if (update.elapsedMs < 120 && update.characters > 30) "引擎很快报告完成；若未听到声音，请检查系统 TTS 和媒体输出。" else "当前语音片段完成。"
+            "error" -> speechError(code)
+            else -> "朗读已停止。"
+        }
+        emitSpeech(update, message)
+    }
+    private fun stopPlayback(reason: String = "朗读已停止。") {
+        val update = speech.cancel(SystemClock.elapsedRealtime())
         tts?.stop()
-        playbackState(false)
+        if (update != null) emitSpeech(update, reason)
     }
     private fun blocked() = WebResourceResponse("text/plain", "UTF-8", ByteArrayInputStream(ByteArray(0)))
     private fun hash(value: String) = MessageDigest.getInstance("SHA-256").digest(value.toByteArray()).joinToString("") { "%02x".format(it) }
@@ -188,7 +248,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         val current = if (ttsReady) engine?.voice else null
         val state = JSONObject().put("engine", label).put("current", current?.name.orEmpty())
             .put("language", current?.locale?.getDisplayName(Locale.SIMPLIFIED_CHINESE).orEmpty())
-            .put("voices", voices).put("rate", voiceRate()).put("message", message)
+            .put("voices", voices).put("rate", voiceRate()).put("message", message).put("diagnostics", speechDiagnostics.joinToString("\n"))
         web.evaluateJavascript("window.setVoiceSettings($state)", null)
     }
     private fun configureVoice(name: String, rate: Float): Boolean {
@@ -205,29 +265,47 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         prefs.edit().putString("voice.name", voice.name).putFloat("voice.rate", rate).apply()
         return true
     }
-    private fun speakText(value: String) {
-        val engine = tts
-        if (!ttsReady || engine == null || offlineVoices().none { it.name == engine.voice?.name }) {
-            toast("离线中文语音尚未就绪，请打开「声音」检查设置。")
+    private fun speakText(value: String, requestId: String) {
+        stopPlayback()
+        val utteranceId = "paragraph-${++speechSequence}"
+        val clean = value.trim()
+        if (!foreground) { emitSpeech(SpeechTracker.Update(utteranceId, requestId, "stopped", clean.length, 0), "应用在后台，未开始朗读。"); return }
+        if (clean.isEmpty()) {
+            val update = SpeechTracker.Update(utteranceId, requestId, "error", 0, 0, TextToSpeech.ERROR_INVALID_REQUEST)
+            emitSpeech(update, "没有可朗读文字。请选中正文文字，或从下一段开始。")
             return
         }
-        if (value.isBlank()) return
-        val utteranceId = "paragraph-${++speechSequence}"
-        activeUtterance = utteranceId
-        val result = engine.speak(value.take(minOf(3500, TextToSpeech.getMaxSpeechInputLength())), TextToSpeech.QUEUE_FLUSH, null, utteranceId)
-        playbackState(result == TextToSpeech.SUCCESS)
-        if (result != TextToSpeech.SUCCESS) { activeUtterance = null; sendVoiceSettings("朗读失败，请检查系统语音引擎或换一个已安装音色。") }
+        val limit = minOf(3500, TextToSpeech.getMaxSpeechInputLength())
+        if (clean.length > limit) {
+            emitSpeech(SpeechTracker.Update(utteranceId, requestId, "error", clean.length, 0, TextToSpeech.ERROR_INVALID_REQUEST), "朗读片段过长，请重新选择较短文字。")
+            return
+        }
+        val engine = tts
+        if (!ttsReady || engine == null || offlineVoices().none { it.name == engine.voice?.name }) {
+            emitSpeech(SpeechTracker.Update(utteranceId, requestId, "error", clean.length, 0, TextToSpeech.ERROR_SERVICE), if (!ttsInitialized) "语音引擎尚未初始化完成或初始化失败，请稍后重试并检查系统 TTS。" else "没有可用的已安装离线中文音色，请打开声音设置检查。")
+            return
+        }
+        emitSpeech(speech.begin(utteranceId, requestId, clean.length, SystemClock.elapsedRealtime()), "已提交朗读请求，等待语音引擎开始。")
+        val result = engine.speak(clean, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
+        if (result != TextToSpeech.SUCCESS) speechEvent(utteranceId, "error", result)
+        else mainHandler.postDelayed({
+            speech.queuedTimeout(utteranceId, SystemClock.elapsedRealtime())?.let { update ->
+                engine.stop(); emitSpeech(update, speechError(update.errorCode))
+            }
+        }, 12000)
     }
     override fun onInit(status: Int) {
-        runOnUiThread {
+        mainHandler.post {
+            if (isDestroyed) return@post
             ttsInitialized = status == TextToSpeech.SUCCESS
             if (ttsInitialized) {
                 tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                    override fun onStart(utteranceId: String?) { runOnUiThread { if (utteranceId == activeUtterance) playbackState(true) } }
-                    override fun onDone(utteranceId: String?) { runOnUiThread { if (utteranceId == activeUtterance) { activeUtterance = null; playbackState(false) } } }
-                    override fun onStop(utteranceId: String?, interrupted: Boolean) { runOnUiThread { if (utteranceId == activeUtterance) { activeUtterance = null; playbackState(false) } } }
+                    override fun onStart(utteranceId: String?) { runOnUiThread { speechEvent(utteranceId, "started") } }
+                    override fun onDone(utteranceId: String?) { runOnUiThread { speechEvent(utteranceId, "done") } }
+                    override fun onStop(utteranceId: String?, interrupted: Boolean) { runOnUiThread { speechEvent(utteranceId, "stopped") } }
                     @Deprecated("Required legacy callback")
-                    override fun onError(utteranceId: String?) { runOnUiThread { if (utteranceId == activeUtterance) { activeUtterance = null; playbackState(false); sendVoiceSettings("语音引擎未能完成朗读，请检查离线语音包。") } } }
+                    override fun onError(utteranceId: String?) { runOnUiThread { speechEvent(utteranceId, "error") } }
+                    override fun onError(utteranceId: String?, errorCode: Int) { runOnUiThread { speechEvent(utteranceId, "error", errorCode) } }
                 })
                 val voices = offlineVoices()
                 val saved = prefs.getString("voice.name", null)
@@ -238,7 +316,8 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         }
     }
     inner class Bridge {
-        @JavascriptInterface fun ready() = runOnUiThread { ready = true; showDocument(); sendVoiceSettings(); playbackState(activeUtterance != null) }
+        @JavascriptInterface fun panelState(open: Boolean) = runOnUiThread { setPanelOpen(open) }
+        @JavascriptInterface fun ready() = runOnUiThread { ready = true; showDocument(); sendVoiceSettings(); setPanelOpen(false) }
         @JavascriptInterface fun openDocument() = runOnUiThread {
             val picker = Intent(Intent.ACTION_OPEN_DOCUMENT).apply { addCategory(Intent.CATEGORY_OPENABLE); type = "*/*" }
             startActivityForResult(picker, OPEN)
@@ -253,13 +332,19 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
                 sendVoiceSettings("该离线音色不可用，设置未保存。请检查系统语音包。")
             } else {
                 sendVoiceSettings("设置已保存。音色的自然度由系统语音引擎决定。")
-                if (preview) speakText("你好，这里是 InkDock。窗外的风轻轻吹过，我们继续读下一段故事。")
+                if (preview) speakText("你好，这里是 InkDock。窗外的风轻轻吹过，我们继续读下一段故事。", "preview-${++speechSequence}")
             }
         }
-        @JavascriptInterface fun speak(value: String) = runOnUiThread { speakText(value) }
+        @JavascriptInterface fun speak(value: String, requestId: String) = runOnUiThread { speakText(value, requestId.take(80)) }
         @JavascriptInterface fun stopSpeaking() = runOnUiThread { stopPlayback() }
     }
-    override fun onPause() { super.onPause(); stopPlayback() }
-    override fun onDestroy() { web.removeJavascriptInterface("Native"); web.destroy(); tts?.shutdown(); io.shutdown(); super.onDestroy() }
+    override fun onResume() { super.onResume(); foreground = true }
+    override fun onPause() {
+        foreground = false
+        super.onPause()
+        stopPlayback("应用进入后台，朗读已停止。")
+        if (ready && !isDestroyed) web.evaluateJavascript("window.stopForBackground && window.stopForBackground()", null)
+    }
+    override fun onDestroy() { setPanelOpen(false); mainHandler.removeCallbacksAndMessages(null); web.removeJavascriptInterface("Native"); web.destroy(); tts?.shutdown(); io.shutdown(); super.onDestroy() }
     companion object { private const val OPEN = 7; private const val MAX_BYTES = 8 * 1024 * 1024 }
 }
