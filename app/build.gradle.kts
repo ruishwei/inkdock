@@ -10,7 +10,7 @@ android {
     // CI selects an existing runner NDK; never request AGP's absent default NDK.
     ndkVersion = providers.environmentVariable("INKDOCK_NDK_VERSION").orNull
         ?: throw GradleException("Set INKDOCK_NDK_VERSION to your already installed NDK revision. This experiment does not install an NDK or accept SDK licenses.")
-    defaultConfig { testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"; applicationId = "org.inkdock.reader"; minSdk = 26; targetSdk = 35; versionCode = 8; versionName = "0.1.0-alpha.8-kokoro-streaming-experimental" }
+    defaultConfig { testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"; applicationId = "org.inkdock.reader"; minSdk = 26; targetSdk = 35; versionCode = 9; versionName = "0.1.0-alpha.9-sleep-timer-experimental" }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     kotlinOptions { jvmTarget = "17" }
     if (arm64Distribution) {
