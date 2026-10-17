@@ -24,6 +24,13 @@ class OfflineEngineSelectionTest {
     @Test fun undeclaredPackageCannotBecomeAvailable() {
         assertFalse(OfflineEngineSelection.resolve("ordinary.app", "system.engine", engines).available)
     }
+    @Test fun internalEngineUsesTheSameExplicitSelectionRules() {
+        val native = "inkdock.kokoro.zh.v1_1"
+        val available = OfflineEngineSelection.resolve(native, "system.engine", engines + native)
+        assertEquals(native, available.packageName); assertTrue(available.available)
+        val removedModel = OfflineEngineSelection.resolve(native, "system.engine", engines)
+        assertEquals(native, removedModel.packageName); assertFalse(removedModel.available)
+    }
     @Test fun catalogSignatureIsStableUnderOrderingButTracksChanges() {
         assertEquals(OfflineEngineSelection.catalogSignature(listOf("a", "b")), OfflineEngineSelection.catalogSignature(listOf("b", "a")))
         assertNotEquals(OfflineEngineSelection.catalogSignature(listOf("a")), OfflineEngineSelection.catalogSignature(listOf("b")))
