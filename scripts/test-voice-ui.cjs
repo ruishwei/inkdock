@@ -9,7 +9,7 @@ const fs=require('node:fs');
   await page.addInitScript(()=>{
    window.calls=[];
    window.Native={ready(){},panelState(){},stopSpeaking(){calls.push(['stop']);},saveProgress(){},getVoiceSettings(){},
-    openOfflineVoiceCenter(){calls.push(['offlineCenter']);},selectVoiceEngine(name){calls.push(['engine',name]);},setSpeechSource(source){calls.push(['source',source]);},
+    openOfflineVoiceCenter(){calls.push(['offlineCenter']);},openKokoroSetup(){calls.push(['kokoroSetup']);},selectVoiceEngine(name){calls.push(['engine',name]);},setSpeechSource(source){calls.push(['source',source]);},
     configureCloudVoice(source){calls.push(['config',source]);},previewCloudVoice(){calls.push(['preview']);},
     saveVoiceSettings(...args){calls.push(['voice',...args]);}};
   });
@@ -21,6 +21,11 @@ const fs=require('node:fs');
   await page.click('#offlineVoiceCenter');assert.deepEqual(await page.evaluate(()=>calls.at(-1)),['offlineCenter']);
   assert.equal(await page.locator('#voicePanel').isVisible(),false);
   await page.evaluate(()=>openPanel('voicePanel'));
+  for(let attempt=0;attempt<2;attempt++) {
+   await page.click('#kokoroSetup');assert.deepEqual(await page.evaluate(()=>calls.at(-1)),['kokoroSetup']);
+   assert.equal(await page.locator('#voicePanel').isVisible(),false);
+   await page.evaluate(()=>openPanel('voicePanel'));
+  }
   fs.mkdirSync('build/screenshots',{recursive:true});
   await page.screenshot({path:'build/screenshots/07-engine-selection.png'});
   await page.selectOption('#engineChoice','test.b');
@@ -38,6 +43,6 @@ const fs=require('node:fs');
   await page.selectOption('#speechSource','offline');assert.deepEqual(await page.evaluate(()=>calls.at(-1)),['source','offline']);
   await page.evaluate(()=>window.handleNativeBack());assert.equal(await page.locator('#voicePanel').isVisible(),false);
   assert.deepEqual(errors,[]);
-  console.log('PASS: offline/cloud UI, engine switch stop ordering, pending init, config/preview/stop routing, Back panel dismissal. No API calls or real audio.');
+  console.log('PASS: offline/cloud UI, repeatable native Kokoro setup routing, immediate engine switch stop ordering, pending init, config/preview/stop routing, Back panel dismissal. No API calls or real audio.');
  }finally{await browser.close();}
 })().catch(e=>{console.error(e);process.exitCode=1});
