@@ -9,6 +9,11 @@ on:
         required: false
         default: ''
         type: string
+      allow_runner_kvm_acl:
+        description: 'One-run approval required: grant this temporary runner user KVM access'
+        required: false
+        default: false
+        type: boolean
 permissions:
   contents: read
 jobs:
@@ -64,6 +69,14 @@ jobs:
         # Use runner's existing SDK licenses; do not silently accept new terms.
         run: sdkmanager --sdk_root="$ANDROID_HOME" 'platforms;android-35' 'build-tools;35.0.0' 'platform-tools' 'emulator' 'system-images;android-35;google_apis;x86_64' </dev/null
       - run: gradle --no-daemon :app:assembleDebug :app:lintDebug :app:testDebugUnitTest :app:assembleDebugAndroidTest
+      - name: Grant explicitly approved one-run KVM access
+        if: github.event_name == 'workflow_dispatch' && inputs.allow_runner_kvm_acl == true
+        shell: bash
+        run: |
+          # Requires fresh approval for this run; never widen access for all users.
+          test -c /dev/kvm
+          command -v setfacl
+          sudo setfacl -m "u:$(id -un):rw" /dev/kvm
       - name: Check existing emulator acceleration access
         run: |
           if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
