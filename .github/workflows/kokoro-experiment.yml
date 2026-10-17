@@ -2,7 +2,7 @@ name: Kokoro experimental JNI audit
 
 on:
   push:
-    branches: ['experiment/**']
+    branches: ['experiment/kokoro-native']
   workflow_dispatch:
 
 permissions:
@@ -15,7 +15,7 @@ concurrency:
 jobs:
   build-and-audit:
     # Explicitly isolated from the alpha release workflow and main branch.
-    if: startsWith(github.ref, 'refs/heads/experiment/')
+    if: github.ref == 'refs/heads/experiment/kokoro-native'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:

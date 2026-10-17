@@ -1,0 +1,282 @@
+name: Kokoro buffered Android device experiment
+
+on:
+  workflow_dispatch:
+    inputs:
+      allow_runner_kvm_acl:
+        description: 'Fresh one-run approval: grant only this temporary runner user KVM access'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: kokoro-device-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BASELINE_REPOSITORY: ruishwei/inkdock
+  BASELINE_RUN: '39017151369'
+  BASELINE_COMMIT: '66356a624b116b61b9f022ccd2fdba247ed3e2e7'
+  BASELINE_ARTIFACT: InkDock-kokoro-experiment-audit-39017151369
+  BASELINE_ARTIFACT_ID: '12095860545'
+  BASELINE_ARTIFACT_DIGEST: 'sha256:64ab9aa071ff91b771e38d0ae1d88d734a31ced2ee8b7ce05def1778e26c6bc8'
+
+jobs:
+  device-experiment:
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'ruishwei/inkdock' && github.ref == 'refs/heads/experiment/kokoro-buffer'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify existing SDK, JDK and NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          test -n "$SDK_ROOT"
+          test -f "$SDK_ROOT/platforms/android-35/android.jar"
+          test -x "$SDK_ROOT/build-tools/35.0.0/zipalign"
+          test -x "${JAVA_HOME_17_X64:?Existing runner JDK 17 is required}/bin/java"
+          SDKMANAGER="$(command -v sdkmanager || true)"
+          if [[ -z "$SDKMANAGER" && -d "$SDK_ROOT/cmdline-tools" ]]; then
+            SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -path '*/bin/sdkmanager' | sort -V | tail -n 1)"
+          fi
+          test -x "$SDKMANAGER"
+          test -x "$(dirname "$SDKMANAGER")/avdmanager"
+          # NDK is discovered only for Gradle packaging. JNI is never recompiled here.
+          python3 - <<'PY'
+          import importlib.util, os, re
+          spec = importlib.util.spec_from_file_location('native', 'scripts/build-kokoro-native.py')
+          native = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(native)
+          ndk = native.find_ndk()
+          revision = re.search(r'^Pkg.Revision\s*=\s*(.+)$', (ndk / 'source.properties').read_text(), re.M)
+          if not revision:
+              raise SystemExit('Existing NDK lacks revision metadata')
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              stream.write('ANDROID_NDK_HOME=' + str(ndk) + '\n')
+              stream.write('INKDOCK_NDK_VERSION=' + revision.group(1) + '\n')
+          print('Existing NDK:', revision.group(1))
+          PY
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
+          echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_17_X64/bin" >> "$GITHUB_PATH"
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/emulator" >> "$GITHUB_PATH"
+          mkdir -p build/kokoro-device/reports
+      - name: Grant explicitly approved temporary runner-user KVM access
+        if: inputs.allow_runner_kvm_acl == true
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The publisher may set true only after fresh approval for this run.
+          # Never chmod the device or grant access to all users/groups.
+          test -c /dev/kvm
+          command -v setfacl
+          sudo setfacl -m "u:$(id -un):rw" /dev/kvm
+      - name: Require existing emulator acceleration access
+        shell: bash
+        run: |
+          if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+            echo '::error::No existing KVM access. This run did not receive approval to alter device access; no emulator can start.'
+            exit 1
+          fi
+      - name: Verify immutable baseline run and artifact metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$BASELINE_REPOSITORY/actions/runs/$BASELINE_RUN" > build/kokoro-device/reports/baseline-run.json
+          gh api "repos/$BASELINE_REPOSITORY/actions/runs/$BASELINE_RUN/artifacts" > build/kokoro-device/reports/baseline-artifacts.json
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          reports = Path('build/kokoro-device/reports')
+          run = json.loads((reports / 'baseline-run.json').read_text())
+          assert run['id'] == int(os.environ['BASELINE_RUN'])
+          assert run['head_sha'] == os.environ['BASELINE_COMMIT']
+          assert run['head_branch'] == 'experiment/kokoro-native'
+          assert run['status'] == 'completed' and run['conclusion'] == 'success'
+          assert run['repository']['full_name'] == os.environ['BASELINE_REPOSITORY']
+          artifacts = json.loads((reports / 'baseline-artifacts.json').read_text())['artifacts']
+          matches = [a for a in artifacts if a['name'] == os.environ['BASELINE_ARTIFACT']]
+          assert len(matches) == 1
+          artifact = matches[0]
+          assert artifact['id'] == int(os.environ['BASELINE_ARTIFACT_ID']) and not artifact['expired']
+          assert artifact['digest'] == os.environ['BASELINE_ARTIFACT_DIGEST']
+          assert artifact['workflow_run']['id'] == int(os.environ['BASELINE_RUN'])
+          assert artifact['workflow_run']['head_sha'] == os.environ['BASELINE_COMMIT']
+          print('Verified successful exact-commit baseline and immutable audit artifact')
+          PY
+      - name: Download exact baseline native audit artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: InkDock-kokoro-experiment-audit-39017151369
+          github-token: ${{ github.token }}
+          repository: ruishwei/inkdock
+          run-id: 39017151369
+          path: ${{ runner.temp }}/kokoro-baseline
+      - name: Import only audited runtime bytes and reverify
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, shutil
+          from pathlib import Path
+          baseline = Path(os.environ['RUNNER_TEMP']) / 'kokoro-baseline'
+          provenance = json.loads((baseline / 'app/src/main/assets/kokoro-native-build.json').read_text())
+          assert provenance['ciCommit'] == os.environ['BASELINE_COMMIT']
+          assert provenance['sourceCommit'] == '0586cd8e14d7eae56e52ae0f1fd7b947e74b84f7'
+          assert provenance['sourceSha256'] == '13101a9ac5f72719a7290c6ec2c0ad71f8392dd974a128a05dfbb6a38f0f44d4'
+          for relative in ('app/src/main/jniLibs', 'app/src/main/assets/licenses/kokoro-native'):
+              source, target = baseline / relative, Path(relative)
+              assert source.is_dir() and not source.is_symlink()
+              assert not any(p.is_symlink() for p in source.rglob('*'))
+              if target.exists():
+                  raise SystemExit('Refusing to overwrite pre-existing generated native output: ' + relative)
+              shutil.copytree(source, target)
+          shutil.copy2(baseline / 'app/src/main/assets/kokoro-native-build.json', 'app/src/main/assets/kokoro-native-build.json')
+          print('Imported baseline JNI/libraries/notices only; current app source remains checked out')
+          PY
+          python3 scripts/build-kokoro-native.py --verify-runtime | tee build/kokoro-device/reports/reused-jni-verification.txt
+          python3 scripts/build-kokoro-native.py --self-test
+          python3 scripts/test-kokoro-native.py
+          python3 scripts/kokoro-device-models.py self-test
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Check current JavaScript sources
+        run: |
+          npm ci --ignore-scripts
+          npm run vendor
+          git diff --exit-code -- app/src/main/assets/vendor
+          npm test
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+      - name: Build current-source app and instrumentation APKs
+        run: gradle --no-daemon -Pandroid.builder.sdkDownload=false :app:assembleDebug :app:assembleDebugAndroidTest :app:lintDebug :app:testDebugUnitTest
+      - name: Audit current-source APK against reused JNI
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          python3 scripts/build-kokoro-native.py --audit-apk "$APK" | tee build/kokoro-device/reports/apk-audit.txt
+          "$ANDROID_HOME/build-tools/35.0.0/zipalign" -c -P 16 -v 4 "$APK" > build/kokoro-device/reports/apk-zipalign.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" > build/kokoro-device/reports/apk-badging.txt
+          sha256sum "$APK" app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk > build/kokoro-device/reports/SHA256SUMS.txt
+          printf '%s\n' "$GITHUB_SHA" > build/kokoro-device/reports/current-source-commit.txt
+      - name: Prepare official API 35 emulator using existing accepted SDK licenses
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s "$ANDROID_HOME/licenses/android-sdk-license"
+          # Official SDK packages only, using the runner's existing accepted licenses.
+          # stdin is closed. Never run --licenses or pipe acceptance to sdkmanager.
+          if [[ ! -x "$ANDROID_HOME/emulator/emulator" || ! -f "$ANDROID_HOME/system-images/android-35/google_apis/x86_64/source.properties" ]]; then
+            "$SDKMANAGER" --sdk_root="$ANDROID_HOME" 'emulator' 'system-images;android-35;google_apis;x86_64' </dev/null
+          fi
+          test -x "$ANDROID_HOME/emulator/emulator"
+          test -f "$ANDROID_HOME/system-images/android-35/google_apis/x86_64/source.properties"
+          cp "$ANDROID_HOME/system-images/android-35/google_apis/x86_64/source.properties" build/kokoro-device/reports/system-image.properties
+          "$ANDROID_HOME/emulator/emulator" -version > build/kokoro-device/reports/emulator-version.txt
+      - name: Download and hash-check only fixed public float/int8 model files
+        run: python3 scripts/kokoro-device-models.py download
+      - name: Run real JNI and buffered-playback instrumentation on disposable API 35
+        timeout-minutes: 40
+        env:
+          INKDOCK_EPHEMERAL_DEVICE_TEST: '1'
+          ANDROID_SERIAL: emulator-5554
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPORTS="$GITHUB_WORKSPACE/build/kokoro-device/reports"
+          export ANDROID_USER_HOME="$RUNNER_TEMP/inkdock-kokoro-device-user"
+          export ANDROID_AVD_HOME="$ANDROID_USER_HOME/avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+          # 'no' declines custom hardware configuration; it is not SDK license acceptance.
+          printf 'no\n' | avdmanager create avd --name inkdock-kokoro-api35 --package 'system-images;android-35;google_apis;x86_64' --device pixel_6 --path "$ANDROID_AVD_HOME/inkdock-kokoro-api35.avd"
+          EMULATOR_PID=''
+          COLLECTED=false
+          cleanup() {
+            set +e
+            if [[ "$COLLECTED" != true ]]; then timeout 180 python3 scripts/kokoro-device-models.py collect; fi
+            timeout 15 adb -s emulator-5554 logcat -d > "$REPORTS/logcat.txt" 2>&1
+            timeout 15 adb -s emulator-5554 shell dumpsys meminfo org.inkdock.reader > "$REPORTS/app-memory.txt" 2>&1
+            timeout 15 adb -s emulator-5554 shell dumpsys activity activities > "$REPORTS/activities.txt" 2>&1
+            timeout 15 adb -s emulator-5554 emu kill
+            if [[ -n "$EMULATOR_PID" ]]; then kill "$EMULATOR_PID" 2>/dev/null; fi
+          }
+          trap cleanup EXIT
+          emulator -avd inkdock-kokoro-api35 -port 5554 -accel on -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect -memory 3072 -cores 2 -partition-size 4096 > "$REPORTS/emulator.log" 2>&1 &
+          EMULATOR_PID=$!
+          timeout 180 adb -s emulator-5554 wait-for-device
+          BOOTED=false
+          for attempt in $(seq 1 150); do
+            kill -0 "$EMULATOR_PID" 2>/dev/null || { cat "$REPORTS/emulator.log"; exit 1; }
+            if [[ "$(timeout 3 adb -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)" == 1 ]]; then BOOTED=true; break; fi
+            sleep 2
+          done
+          [[ "$BOOTED" == true ]] || { cat "$REPORTS/emulator.log"; echo 'Emulator boot timed out'; exit 1; }
+          test "$(adb -s emulator-5554 shell getprop ro.build.version.sdk | tr -d '\r')" = 35
+          test "$(adb -s emulator-5554 shell getprop ro.product.cpu.abi | tr -d '\r')" = x86_64
+          test "$(adb -s emulator-5554 shell getprop ro.kernel.qemu | tr -d '\r')" = 1
+          adb -s emulator-5554 shell getprop > "$REPORTS/device-properties.txt"
+          adb -s emulator-5554 shell input keyevent 224
+          adb -s emulator-5554 shell input keyevent 82
+          # Keep long model initialization from causing an incidental idle timeout.
+          # The screen-off test still explicitly sends KEYCODE_SLEEP and verifies it.
+          adb -s emulator-5554 shell settings put system screen_off_timeout 1800000
+          adb -s emulator-5554 shell settings put global window_animation_scale 0
+          adb -s emulator-5554 shell settings put global transition_animation_scale 0
+          adb -s emulator-5554 shell settings put global animator_duration_scale 0
+          adb -s emulator-5554 install -r app/build/outputs/apk/debug/app-debug.apk
+          adb -s emulator-5554 install -r app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+          python3 scripts/kokoro-device-models.py stage
+          adb -s emulator-5554 logcat -c
+          # Explicit new test classes only. No cloud provider/test credentials/user text.
+          set +e
+          timeout 1800 adb -s emulator-5554 shell am instrument -w -r \
+            -e class org.inkdock.reader.KokoroNativeDeviceTest,org.inkdock.reader.KokoroModelTransferDeviceTest,org.inkdock.reader.NativePcmPrefetchDeviceTest \
+            -e kokoroVariants float,int8 \
+            org.inkdock.reader.test/androidx.test.runner.AndroidJUnitRunner 2>&1 | tee "$REPORTS/instrumentation.txt"
+          INSTRUMENTATION_EXIT=${PIPESTATUS[0]}
+          set -e
+          python3 scripts/kokoro-device-models.py report --exit-code "$INSTRUMENTATION_EXIT"
+          python3 scripts/kokoro-device-models.py collect --require-all
+          COLLECTED=true
+      - name: Preserve synthetic audio, timings and Android reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: InkDock-kokoro-device-evidence-${{ github.run_id }}
+          path: |
+            build/kokoro-device/reports/
+            build/kokoro-device/native-test-artifacts/
+            build/kokoro-device/model-inputs.json
+            app/build/reports/lint-results-debug.*
+            app/build/reports/tests/
+            app/build/test-results/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Preserve current-source experimental debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: InkDock-kokoro-buffer-device-apk-${{ github.run_id }}
+          path: |
+            app/build/outputs/apk/debug/app-debug.apk
+            build/kokoro-device/reports/SHA256SUMS.txt
+            build/kokoro-device/reports/current-source-commit.txt
+          if-no-files-found: error
+          retention-days: 14
