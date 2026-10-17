@@ -4,6 +4,11 @@ import android.app.Activity
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.os.Build
+import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
+import android.view.View
+import android.view.WindowInsetsController
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.speech.tts.Voice
@@ -25,6 +30,10 @@ import java.util.concurrent.Executors
 /** Only our packaged UI can reach this bridge. No network or storage permission. */
 class MainActivity : Activity(), TextToSpeech.OnInitListener {
     private lateinit var web: WebView
+    private lateinit var root: FrameLayout
+    private var appliedDark: Boolean? = null
+    private var speechSequence = 0
+    private var activeUtterance: String? = null
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private var ttsInitialized = false
@@ -41,7 +50,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         web = WebView(this)
         web.setBackgroundColor(0xfffaf7ef.toInt())
         // Android 15 enforces edge-to-edge. Keep controls outside system bars.
-        val root = FrameLayout(this)
+        root = FrameLayout(this)
         root.addView(web, FrameLayout.LayoutParams(-1, -1))
         root.setOnApplyWindowInsetsListener { view, insets ->
             val bars = insets.systemWindowInsetTop
@@ -50,6 +59,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         }
         setContentView(root)
         root.requestApplyInsets()
+        applyReaderTheme(prefs.getBoolean("dark", false))
         web.isVerticalScrollBarEnabled = false
         web.isHorizontalScrollBarEnabled = false
         web.settings.javaScriptEnabled = true
@@ -73,6 +83,38 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         handleIntent(intent)
     }
 
+    @Suppress("DEPRECATION")
+    private fun applyReaderTheme(dark: Boolean) {
+        if (appliedDark == dark) return
+        appliedDark = dark
+        val color = Color.parseColor(if (dark) "#181b20" else "#faf7ef")
+        root.setBackgroundColor(color)
+        web.setBackgroundColor(color)
+        window.setBackgroundDrawable(ColorDrawable(color))
+        window.statusBarColor = Color.TRANSPARENT
+        window.navigationBarColor = Color.TRANSPARENT
+        if (Build.VERSION.SDK_INT >= 29) {
+            window.isStatusBarContrastEnforced = false
+            window.isNavigationBarContrastEnforced = false
+        }
+        if (Build.VERSION.SDK_INT >= 30) {
+            val appearance = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
+            // The first onCreate call can precede view attachment.
+            root.post { window.insetsController?.setSystemBarsAppearance(if (appliedDark == true) 0 else appearance, appearance) }
+        } else {
+            val lightIcons = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+            window.decorView.systemUiVisibility = if (dark) window.decorView.systemUiVisibility and lightIcons.inv()
+                else window.decorView.systemUiVisibility or lightIcons
+        }
+    }
+    private fun playbackState(playing: Boolean) {
+        if (ready && !isDestroyed) web.evaluateJavascript("window.setPlaybackState($playing)", null)
+    }
+    private fun stopPlayback() {
+        activeUtterance = null
+        tts?.stop()
+        playbackState(false)
+    }
     private fun blocked() = WebResourceResponse("text/plain", "UTF-8", ByteArrayInputStream(ByteArray(0)))
     private fun hash(value: String) = MessageDigest.getInstance("SHA-256").digest(value.toByteArray()).joinToString("") { "%02x".format(it) }
     private fun toast(message: String) = runOnUiThread { Toast.makeText(this, message, Toast.LENGTH_LONG).show() }
@@ -152,7 +194,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     private fun configureVoice(name: String, rate: Float): Boolean {
         val engine = tts ?: return false
         val voice = offlineVoices().firstOrNull { it.name == name } ?: return false
-        engine.stop()
+        stopPlayback()
         ttsReady = false
         if (engine.setVoice(voice) != TextToSpeech.SUCCESS || engine.setSpeechRate(rate) != TextToSpeech.SUCCESS) return false
         // Do not trust a successful request if the engine silently selected a different voice.
@@ -169,18 +211,23 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
             toast("离线中文语音尚未就绪，请打开「声音」检查设置。")
             return
         }
-        val result = engine.speak(value.take(minOf(3500, TextToSpeech.getMaxSpeechInputLength())), TextToSpeech.QUEUE_FLUSH, null, "paragraph")
-        if (result != TextToSpeech.SUCCESS) sendVoiceSettings("朗读失败，请检查系统语音引擎或换一个已安装音色。")
+        if (value.isBlank()) return
+        val utteranceId = "paragraph-${++speechSequence}"
+        activeUtterance = utteranceId
+        val result = engine.speak(value.take(minOf(3500, TextToSpeech.getMaxSpeechInputLength())), TextToSpeech.QUEUE_FLUSH, null, utteranceId)
+        playbackState(result == TextToSpeech.SUCCESS)
+        if (result != TextToSpeech.SUCCESS) { activeUtterance = null; sendVoiceSettings("朗读失败，请检查系统语音引擎或换一个已安装音色。") }
     }
     override fun onInit(status: Int) {
         runOnUiThread {
             ttsInitialized = status == TextToSpeech.SUCCESS
             if (ttsInitialized) {
                 tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                    override fun onStart(utteranceId: String?) {}
-                    override fun onDone(utteranceId: String?) {}
+                    override fun onStart(utteranceId: String?) { runOnUiThread { if (utteranceId == activeUtterance) playbackState(true) } }
+                    override fun onDone(utteranceId: String?) { runOnUiThread { if (utteranceId == activeUtterance) { activeUtterance = null; playbackState(false) } } }
+                    override fun onStop(utteranceId: String?, interrupted: Boolean) { runOnUiThread { if (utteranceId == activeUtterance) { activeUtterance = null; playbackState(false) } } }
                     @Deprecated("Required legacy callback")
-                    override fun onError(utteranceId: String?) { runOnUiThread { sendVoiceSettings("语音引擎未能完成朗读，请检查离线语音包。") } }
+                    override fun onError(utteranceId: String?) { runOnUiThread { if (utteranceId == activeUtterance) { activeUtterance = null; playbackState(false); sendVoiceSettings("语音引擎未能完成朗读，请检查离线语音包。") } } }
                 })
                 val voices = offlineVoices()
                 val saved = prefs.getString("voice.name", null)
@@ -191,12 +238,13 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         }
     }
     inner class Bridge {
-        @JavascriptInterface fun ready() = runOnUiThread { ready = true; showDocument(); sendVoiceSettings() }
+        @JavascriptInterface fun ready() = runOnUiThread { ready = true; showDocument(); sendVoiceSettings(); playbackState(activeUtterance != null) }
         @JavascriptInterface fun openDocument() = runOnUiThread {
             val picker = Intent(Intent.ACTION_OPEN_DOCUMENT).apply { addCategory(Intent.CATEGORY_OPENABLE); type = "*/*" }
             startActivityForResult(picker, OPEN)
         }
         @JavascriptInterface fun saveProgress(anchor: Int, font: Int, dark: Boolean) = runOnUiThread {
+            applyReaderTheme(dark)
             prefs.edit().putInt("anchor.$documentId", anchor.coerceAtLeast(0)).putInt("font", font.coerceIn(14, 32)).putBoolean("dark", dark).apply()
         }
         @JavascriptInterface fun getVoiceSettings() = runOnUiThread { sendVoiceSettings() }
@@ -209,9 +257,9 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
             }
         }
         @JavascriptInterface fun speak(value: String) = runOnUiThread { speakText(value) }
-        @JavascriptInterface fun stopSpeaking() = runOnUiThread { tts?.stop() }
+        @JavascriptInterface fun stopSpeaking() = runOnUiThread { stopPlayback() }
     }
-    override fun onPause() { super.onPause(); tts?.stop() }
+    override fun onPause() { super.onPause(); stopPlayback() }
     override fun onDestroy() { web.removeJavascriptInterface("Native"); web.destroy(); tts?.shutdown(); io.shutdown(); super.onDestroy() }
     companion object { private const val OPEN = 7; private const val MAX_BYTES = 8 * 1024 * 1024 }
 }
