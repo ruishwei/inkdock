@@ -7,13 +7,14 @@
 <p id="voiceEngine">语音引擎初始化中…</p><p id="voiceCurrent"></p>
 <label for="voiceChoice">已安装的离线中文音色</label><select id="voiceChoice"></select>
 <label for="voiceRate">语速 <output id="rateValue">1.00×</output></label><input id="voiceRate" type="range" min="0.5" max="1.5" step="0.05" value="1">
-<p id="voiceStatus" role="status"></p><div class="voice-actions"><button id="saveVoice">保存设置</button><button id="previewVoice">保存并试听</button><button id="voiceStop">停止</button></div>
+<p id="voiceStatus" role="status"></p><details><summary>本次会话语音诊断（不含正文）</summary><pre id="voiceDiagnostics"></pre></details><div class="voice-actions"><button id="saveVoice">保存设置</button><button id="previewVoice">保存并试听</button><button id="voiceStop">停止</button></div>
 <p class="hint">中文正文选中文音色。自然度和情感由手机语音引擎决定，改语言或语速不会自动变成有感情的朗读。这里只使用已安装的离线音色，不下载或调用在线服务。</p>
 </section>
-<section id="morePanel" class="panel" hidden aria-label="更多设置"><div class="panel-heading"><strong>更多</strong><button id="closeMore" aria-label="关闭更多设置">关闭</button></div><div class="more-grid"><button id="open">导入文档</button><button id="theme">夜间模式</button><button id="smaller" aria-label="缩小字号">字号 A−</button><button id="larger" aria-label="放大字号">字号 A+</button><button id="voiceSettings">声音设置</button></div><p class="hint">轻点正文显示或隐藏底栏。滑动仅用于阅读；选字和公式区域不会切换底栏。朗读按钮在播放时变为停止，再次播放从当前段落起读，不是断点暂停。</p></section>
+<section id="morePanel" class="panel" hidden aria-label="更多设置"><div class="panel-heading"><strong>更多</strong><button id="closeMore" aria-label="关闭更多设置">关闭</button></div><div class="more-grid"><button id="open">导入文档</button><button id="theme">夜间模式</button><button id="smaller" aria-label="缩小字号">字号 A−</button><button id="larger" aria-label="放大字号">字号 A+</button><button id="voiceSettings">声音设置</button></div><p class="hint">轻点正文显示或隐藏底栏。滑动仅用于阅读；选字和公式区域不会切换底栏。朗读从当前正文段连续往后播放，选中文字只读选中部分。按钮变为停止可取消，重播从当前段落起读。云语音 / LLM 配置尚未提供。</p></section>
+<p id="playbackStatus" class="playback-status" role="status" aria-live="polite" hidden></p>
 <div id="toolbar" role="toolbar" aria-label="阅读工具">
 <button id="tocButton" class="icon-button" aria-label="打开目录" title="目录"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5h13M8 12h13M8 19h13M3 5h.01M3 12h.01M3 19h.01"/></svg></button>
 <button id="speak" class="icon-button" aria-label="朗读当前段落或所选文字" title="朗读"><svg id="playIcon" viewBox="0 0 24 24" aria-hidden="true"><path d="m8 4 12 8-12 8Z"/></svg><svg id="stopIcon" viewBox="0 0 24 24" aria-hidden="true" hidden><path d="M6 6h12v12H6Z"/></svg></button>
 <button id="moreButton" class="icon-button" aria-label="打开更多设置" title="更多"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></svg></button>
 </div>
-<script src="vendor/marked.js"></script><script src="vendor/purify.js"></script><script src="vendor/katex.js"></script><script src="engine.js"></script><script src="gestures.js"></script><script src="reader.js"></script></body></html>
+<script src="vendor/marked.js"></script><script src="vendor/purify.js"></script><script src="vendor/katex.js"></script><script src="engine.js"></script><script src="gestures.js"></script><script src="speech.js"></script><script src="reader.js"></script></body></html>

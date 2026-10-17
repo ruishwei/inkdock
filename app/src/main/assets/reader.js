@@ -20,7 +20,7 @@ function buildToc(){
  for(const h of book.headings){const node={...h,children:[]};while(stack.length&&stack.at(-1).level>=h.level)stack.pop();(stack.length?stack.at(-1).children:roots).push(node);stack.push(node);}
  function append(nodes,parent){for(const h of nodes){
   const wrapper=document.createElement('div'),row=document.createElement('div');row.className='toc-row';
-  const title=document.createElement('button');title.className='toc-title';title.textContent=h.title;title.onclick=()=>{closePanels();render(h.block);};
+  const title=document.createElement('button');title.className='toc-title';title.textContent=h.title;title.onclick=()=>{cancelReading();closePanels();render(h.block);};
   if(h.children.length){const arrow=document.createElement('button'),children=document.createElement('div');arrow.className='toc-toggle';children.className='toc-children';children.id='toc-children-'+h.block;children.hidden=h.level>2;
    function update(){arrow.textContent=children.hidden?'›':'⌄';arrow.setAttribute('aria-expanded',String(!children.hidden));arrow.setAttribute('aria-label',(children.hidden?'展开':'收起')+h.title);}
    arrow.setAttribute('aria-controls',children.id);arrow.onclick=()=>{children.hidden=!children.hidden;update();};update();row.append(arrow,title);wrapper.append(row,children);append(h.children,children);
@@ -30,32 +30,66 @@ function buildToc(){
  append(roots,$('toc'));if(!book.headings.length)$('toc').textContent='此文档没有标题。';
 }
 function persist(){if(bridge)bridge.saveProgress(current,size,document.body.classList.contains('dark'));}
-window.loadDocument=(text,anchor=0,font=20,dark=false)=>{book=InkEngine.indexDocument(text);size=Math.max(14,Math.min(32,font));$('content').style.fontSize=`${size}px`;document.body.classList.toggle('dark',dark);$('theme').textContent=dark?'日间模式':'夜间模式';buildToc();render(anchor);};
-$('open').onclick=()=>bridge?.openDocument();$('tocButton').onclick=()=>openPanel('tocPanel');
+window.loadDocument=(text,anchor=0,font=20,dark=false)=>{cancelReading();readingStatus('');book=InkEngine.indexDocument(text);size=Math.max(14,Math.min(32,font));$('content').style.fontSize=`${size}px`;document.body.classList.toggle('dark',dark);$('theme').textContent=dark?'日间模式':'夜间模式';buildToc();render(anchor);};
+$('open').onclick=()=>{cancelReading();bridge?.openDocument();};$('tocButton').onclick=()=>openPanel('tocPanel');
 $('prev').onclick=()=>render(Math.max(0,(page-1)*40));$('next').onclick=()=>render(Math.min(book.blocks.length-1,(page+1)*40));
 $('smaller').onclick=()=>{size=Math.max(14,size-2);$('content').style.fontSize=`${size}px`;persist();};
 $('larger').onclick=()=>{size=Math.min(32,size+2);$('content').style.fontSize=`${size}px`;persist();};
 $('theme').onclick=()=>{document.body.classList.toggle('dark');$('theme').textContent=document.body.classList.contains('dark')?'日间模式':'夜间模式';persist();};
-let speakSelection='';
+let speakSelection='',playing=false,reading=null,requestCounter=0;
+function updatePlayButton(active){playing=!!active;$('playIcon').toggleAttribute('hidden',playing);$('stopIcon').toggleAttribute('hidden',!playing);$('speak').setAttribute('aria-label',playing?'停止朗读':'从当前段连续朗读或朗读所选文字');$('speak').title=playing?'停止朗读':'连续朗读';}
+function readingStatus(message){$('playbackStatus').textContent=message;$('playbackStatus').hidden=!message;}
+function clearHighlight(){document.querySelectorAll('.speaking').forEach(el=>el.classList.remove('speaking'));}
+function cancelReading(){reading=null;clearHighlight();updatePlayButton(false);bridge?.stopSpeaking();}
+window.stopForBackground=()=>{cancelReading();readingStatus('应用进入后台，朗读已停止。');};
+function blockSpeech(index){const block=book.blocks[index];if(!block||['heading','code','hr','displayMath'].includes(block.token.type))return '';
+ const holder=document.createElement('div');holder.innerHTML=safeHtml(block);holder.querySelectorAll('.katex').forEach(el=>el.replaceWith(document.createTextNode('（公式）')));
+ const value=(holder.textContent||'').trim();return value.replace(/[（()）\s]/g,'')==='公式'?'':value;
+}
+function sendReadingPart(){
+ const job=reading;if(!job)return;
+ if(job.mode==='continuous'){
+  while(job.part>=job.parts.length){if(job.nextBlock>=book.blocks.length){reading=null;clearHighlight();updatePlayButton(false);readingStatus(job.sent?'全文朗读完成。':'没有可朗读的正文段落；标题、纯公式和代码块会跳过。');return;}
+   job.block=job.nextBlock++;job.parts=InkSpeech.splitText(blockSpeech(job.block));job.part=0;
+  }
+  if(Math.floor(job.block/40)!==page)render(job.block);
+  current=job.block;clearHighlight();const element=document.getElementById(`p-${job.block}`);element?.classList.add('speaking');element?.scrollIntoView({block:'nearest'});persist();
+ }else if(job.part>=job.parts.length){reading=null;updatePlayButton(false);readingStatus('选中文字朗读完成。');return;}
+ job.sent=(job.sent||0)+1;job.requestId='reader-'+(++requestCounter);readingStatus('正在提交语音片段…');updatePlayButton(true);
+ if(bridge)bridge.speak(job.parts[job.part],job.requestId);else{reading=null;updatePlayButton(false);readingStatus('浏览器预览没有 Android 语音引擎。');}
+}
 $('speak').addEventListener('pointerdown',()=>{speakSelection=window.getSelection()?.toString()||'';});
-$('speak').onclick=()=>{if(playing){bridge?.stopSpeaking();return;}const selection=speakSelection||window.getSelection()?.toString();speakSelection='';bridge?.speak((selection||document.getElementById(`p-${current}`)?.innerText||'').slice(0,3500));};
-let playing=false;
-window.setPlaybackState=active=>{playing=!!active;$('playIcon').toggleAttribute('hidden',playing);$('stopIcon').toggleAttribute('hidden',!playing);$('speak').setAttribute('aria-label',playing?'停止朗读':'朗读当前段落或所选文字');$('speak').title=playing?'停止朗读':'朗读';};
+$('speak').onclick=()=>{
+ const captured=speakSelection;speakSelection='';
+ if(playing){cancelReading();readingStatus('朗读已停止。');return;}
+ const selected=(captured||window.getSelection()?.toString()||'').trim();
+ reading=selected?{mode:'selection',parts:InkSpeech.splitText(selected),part:0}:{mode:'continuous',nextBlock:current,block:current,parts:[],part:0};sendReadingPart();
+};
+window.onSpeechStatus=event=>{
+ const job=reading;if(job&&event.requestId!==job.requestId)return;
+ if(!job&&event.requestId?.startsWith('reader-'))return;
+ readingStatus(event.message||event.phase);
+ if(event.phase==='queued'||event.phase==='started')updatePlayButton(true);
+ else if(event.phase==='done'&&job){job.part++;setTimeout(()=>{if(reading===job)sendReadingPart();},120);}
+ else{if(event.phase==='error'||event.phase==='stopped')reading=null;clearHighlight();updatePlayButton(false);}
+};
 window.addEventListener('scroll',()=>{clearTimeout(saveTimer);saveTimer=setTimeout(()=>{const sections=[...$('content').children];const visible=sections.find(el=>el.getBoundingClientRect().bottom>16);if(visible){current=Number(visible.dataset.index);persist();}},200);});
 function showToolbar(visible){
  $('toolbar').classList.toggle('is-hidden',!visible);$('toolbar').inert=!visible;
  $('toolbar').setAttribute('aria-hidden',String(!visible));
 }
-function closePanels(){for(const id of ['tocPanel','voicePanel','morePanel'])$(id).hidden=true;}
-function openPanel(id){cancelTap();closePanels();showToolbar(true);$(id).hidden=false;}
+function closePanels(){for(const id of ['tocPanel','voicePanel','morePanel'])$(id).hidden=true;bridge?.panelState(false);}
+window.handleNativeBack=()=>{const open=['tocPanel','voicePanel','morePanel'].some(id=>!$(id).hidden);if(open){closePanels();showToolbar(true);}return open;};
+function openPanel(id){cancelTap();closePanels();showToolbar(true);$(id).hidden=false;bridge?.panelState(true);}
 $('moreButton').onclick=()=>openPanel('morePanel');$('closeMore').onclick=closePanels;
 $('closeToc').onclick=closePanels;$('closeVoice').onclick=closePanels;
 $('voiceSettings').onclick=()=>{openPanel('voicePanel');bridge?.getVoiceSettings();};
 $('voiceRate').oninput=()=>{$('rateValue').textContent=Number($('voiceRate').value).toFixed(2)+'×';};
-function saveVoice(preview){bridge?.saveVoiceSettings($('voiceChoice').value,Number($('voiceRate').value),preview);}
+function saveVoice(preview){cancelReading();bridge?.saveVoiceSettings($('voiceChoice').value,Number($('voiceRate').value),preview);}
 $('saveVoice').onclick=()=>saveVoice(false);$('previewVoice').onclick=()=>saveVoice(true);
-$('voiceStop').onclick=()=>bridge?.stopSpeaking();
+$('voiceStop').onclick=()=>{cancelReading();readingStatus('朗读已停止。');};
 window.setVoiceSettings=state=>{
+ $('voiceDiagnostics').textContent=state.diagnostics||'尚无朗读事件。';
  $('voiceEngine').textContent='系统默认引擎：'+(state.engine||'不可用');
  $('voiceCurrent').textContent='当前语言 / 音色：'+(state.language||'未设置')+' / '+(state.current||'无可用音色');
  $('voiceChoice').replaceChildren();
