@@ -1,0 +1,144 @@
+name: Kokoro ARM64 stripped distribution candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      passed_device_run_id:
+        description: 'Successful buffered-device run with identical app source/test/build inputs'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: kokoro-arm64-distribution-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  arm64-distribution:
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'ruishwei/inkdock' && github.ref == 'refs/heads/experiment/kokoro-buffer'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify existing licensed SDK, JDK and NDK tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          test -n "$SDK_ROOT"
+          test -s "$SDK_ROOT/licenses/android-sdk-license"
+          test -f "$SDK_ROOT/platforms/android-35/android.jar"
+          for TOOL in zipalign aapt apksigner; do test -x "$SDK_ROOT/build-tools/35.0.0/$TOOL"; done
+          test -x "${JAVA_HOME_17_X64:?Existing runner JDK 17 is required}/bin/java"
+          python3 - <<'PY'
+          import importlib.util, os, re
+          spec = importlib.util.spec_from_file_location('native', 'scripts/build-kokoro-native.py')
+          native = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(native)
+          ndk = native.find_ndk()
+          revision = re.search(r'^Pkg.Revision\s*=\s*(.+)$', (ndk / 'source.properties').read_text(), re.M)
+          if not revision:
+              raise SystemExit('Existing NDK lacks revision metadata')
+          hosts = [p for p in (ndk / 'toolchains/llvm/prebuilt').glob('*') if (p / 'bin/llvm-strip').is_file()]
+          if len(hosts) != 1 or not all((hosts[0] / 'bin' / ('llvm-' + name)).is_file() for name in ('strip', 'nm', 'readelf')):
+              raise SystemExit('Existing NDK lacks required LLVM tools')
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              stream.write('ANDROID_NDK_HOME=' + str(ndk) + '\n')
+              stream.write('INKDOCK_NDK_VERSION=' + revision.group(1) + '\n')
+          print('Existing NDK:', revision.group(1))
+          PY
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_17_X64/bin" >> "$GITHUB_PATH"
+          mkdir -p build/kokoro-arm64/input-evidence build/kokoro-arm64/reports
+      - name: Require exact baseline and already-passing app/device inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEVICE_RUN_ID: ${{ inputs.passed_device_run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$DEVICE_RUN_ID" =~ ^[0-9]+$ ]]
+          EVIDENCE=build/kokoro-arm64/input-evidence
+          gh api repos/ruishwei/inkdock/actions/runs/39017151369 > "$EVIDENCE/baseline-run.json"
+          gh api repos/ruishwei/inkdock/actions/runs/39017151369/artifacts > "$EVIDENCE/baseline-artifacts.json"
+          gh api "repos/ruishwei/inkdock/actions/runs/$DEVICE_RUN_ID" > "$EVIDENCE/device-run.json"
+          DEVICE_COMMIT="$(python3 -c 'import json,re; s=json.load(open("build/kokoro-arm64/input-evidence/device-run.json"))["head_sha"]; assert re.fullmatch("[0-9a-f]{40}",s); print(s)')"
+          gh api "repos/ruishwei/inkdock/git/commits/$GITHUB_SHA" > "$EVIDENCE/current-commit.json"
+          gh api "repos/ruishwei/inkdock/git/commits/$DEVICE_COMMIT" > "$EVIDENCE/device-commit.json"
+          gh api "repos/ruishwei/inkdock/git/trees/$GITHUB_SHA?recursive=1" > "$EVIDENCE/current-tree.json"
+          gh api "repos/ruishwei/inkdock/git/trees/$DEVICE_COMMIT?recursive=1" > "$EVIDENCE/device-tree.json"
+          gh api "repos/ruishwei/inkdock/contents/app/build.gradle.kts?ref=$GITHUB_SHA" > "$EVIDENCE/current-app-gradle.json"
+          gh api "repos/ruishwei/inkdock/contents/app/build.gradle.kts?ref=$DEVICE_COMMIT" > "$EVIDENCE/device-app-gradle.json"
+          python3 scripts/prepare-kokoro-arm64.py --verify-evidence "$EVIDENCE" | tee build/kokoro-arm64/reports/device-input-gate.json
+      - name: Download exact raw audit ZIP and verify its pinned digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The script checks the actual downloaded archive SHA, not only API metadata.
+          gh api repos/ruishwei/inkdock/actions/artifacts/12095860545/zip > "$RUNNER_TEMP/kokoro-baseline-audit.zip"
+          python3 scripts/build-kokoro-native.py --self-test
+          python3 scripts/test-kokoro-native.py
+          python3 scripts/test-kokoro-arm64.py
+          python3 scripts/prepare-kokoro-arm64.py --prepare "$RUNNER_TEMP/kokoro-baseline-audit.zip" --evidence build/kokoro-arm64/input-evidence | tee build/kokoro-arm64/reports/prepare.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Check current JavaScript sources
+        run: |
+          npm ci --ignore-scripts
+          npm run vendor
+          git diff --exit-code -- app/src/main/assets/vendor
+          npm test
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+      - name: Build opt-in ARM64 experimental debug candidate
+        run: gradle --no-daemon -Pandroid.builder.sdkDownload=false -PinkdockArm64Distribution=true :app:assembleDebug :app:lintDebug :app:testDebugUnitTest
+      - name: Audit exact final APK bytes, ELF, JNI, alignment and notices
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          REPORTS=build/kokoro-arm64/reports
+          python3 scripts/prepare-kokoro-arm64.py --audit-apk "$APK" | tee "$REPORTS/final-apk-audit.txt"
+          "$ANDROID_HOME/build-tools/35.0.0/zipalign" -c -P 16 -v 4 "$APK" > "$REPORTS/apk-zipalign.txt"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK" > "$REPORTS/apk-signature.txt"
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" > "$REPORTS/apk-badging.txt"
+          grep -Fx "native-code: 'arm64-v8a'" "$REPORTS/apk-badging.txt"
+          mkdir -p build/kokoro-arm64/candidate
+          cp "$APK" build/kokoro-arm64/candidate/InkDock-kokoro-buffer-arm64-experimental.apk
+          cp "$REPORTS/final-apk-audit.json" build/kokoro-arm64/candidate/
+          printf '%s\n' "$GITHUB_SHA" > build/kokoro-arm64/candidate/current-source-commit.txt
+          (cd build/kokoro-arm64/candidate && sha256sum InkDock-kokoro-buffer-arm64-experimental.apk > SHA256SUMS.txt)
+      - name: Preserve raw dual-ABI debug libraries, full symbols and distribution evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: InkDock-kokoro-arm64-distribution-audit-${{ github.run_id }}
+          path: |
+            build/kokoro-arm64/audit/
+            build/kokoro-arm64/staging/assets/
+            build/kokoro-arm64/input-evidence/
+            build/kokoro-arm64/reports/
+            app/build/reports/lint-results-debug.*
+            app/build/reports/tests/
+            app/build/test-results/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Preserve verified ARM64 candidate only after all gates pass
+        uses: actions/upload-artifact@v4
+        with:
+          name: InkDock-kokoro-buffer-arm64-candidate-${{ github.run_id }}
+          path: build/kokoro-arm64/candidate/
+          if-no-files-found: error
+          retention-days: 14
