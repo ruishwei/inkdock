@@ -10,7 +10,9 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.provider.Settings
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
@@ -51,8 +53,14 @@ class OfflineSpeechService : Service() {
     private var engineGeneration = 0
     private var requestedEngine = ""
     private var engineLoading = false
-    private var installedEngines: List<TextToSpeech.EngineInfo> = emptyList()
+    private data class DeclaredEngine(val name: String, val label: String)
+    private var installedEngines: List<DeclaredEngine> = emptyList()
+    private var engineStatus = "uninitialized"
+    private var engineMessage = ""
+    private var voiceCatalogSignature = ""
+    private var voiceCatalogChanged = false
     private var ttsReady = false
+    private var configuredVoiceName = ""
     private var ttsInitialized = false
     private var destroyed = false
     private var request: OfflineSpeechRequest? = null
@@ -193,6 +201,11 @@ class OfflineSpeechService : Service() {
             failQueue(if (!ttsInitialized) "语音引擎尚未初始化完成或初始化失败，请检查系统 TTS。" else "没有可用的已安装离线中文音色，请打开声音设置检查。")
             return
         }
+        if (engine.voice?.name != configuredVoiceName) {
+            ttsReady = false; engineStatus = "voice-unavailable"
+            engineMessage = "引擎当前音色与已选音色不一致，已停止朗读；请重新选择音色并试听。"
+            sendVoiceSettings(); failQueue(engineMessage); return
+        }
         ensureForeground()
         if (!focused) {
             focused = audio.requestAudioFocus(focusRequest) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
@@ -301,62 +314,114 @@ class OfflineSpeechService : Service() {
             !it.features.orEmpty().contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED)
     }.sortedWith(compareBy({ it.locale.toLanguageTag() }, { it.name }))
     private fun voiceRate() = prefs.getFloat("voice.rate", 1f).coerceIn(0.5f, 1.5f)
+    @Suppress("DEPRECATION")
+    private fun discoverEngines(): List<DeclaredEngine> = try {
+        packageManager.queryIntentServices(Intent(TextToSpeech.Engine.INTENT_ACTION_TTS_SERVICE), PackageManager.GET_META_DATA)
+            .mapNotNull { result -> result.serviceInfo?.takeIf { it.exported && it.enabled && it.applicationInfo.enabled &&
+                (it.permission.isNullOrBlank() || checkSelfPermission(it.permission) == PackageManager.PERMISSION_GRANTED) }
+                ?.let { DeclaredEngine(it.packageName, result.loadLabel(packageManager).toString()) } }
+            .distinctBy { it.name }.sortedBy { it.label }
+    } catch (_: RuntimeException) { emptyList() }
+    @Suppress("DEPRECATION")
+    private fun systemDefaultEngine(): String = try {
+        Settings.Secure.getString(contentResolver, Settings.Secure.TTS_DEFAULT_SYNTH).orEmpty()
+    } catch (_: RuntimeException) { "" }
     internal fun voiceSettings(reason: String = ""): JSONObject {
-        installedEngines = tts?.engines.orEmpty().sortedBy { it.label.toString() }
+        installedEngines = discoverEngines()
         val engines = JSONArray(); installedEngines.forEach { engines.put(JSONObject().put("name", it.name).put("label", it.label)) }
         val voices = JSONArray(); offlineVoices().forEach { voices.put(JSONObject().put("name", it.name).put("language", it.locale.getDisplayName(Locale.SIMPLIFIED_CHINESE))) }
         val current = if (ttsReady) tts?.voice else null
         return JSONObject().put("engine", installedEngines.firstOrNull { it.name == requestedEngine }?.label ?: requestedEngine)
-            .put("enginePackage", requestedEngine).put("engines", engines).put("source", "offline")
+            .put("enginePackage", requestedEngine).put("requestedEngine", requestedEngine).put("engines", engines).put("source", "offline")
+            .put("engineState", engineStatus).put("engineStatus", "Android 公开接口无法确认实际绑定的引擎包名；若声音不符，请停止朗读并检查系统引擎。")
+            .put("engineVerified", false).put("engineBindingVerified", false)
+            .put("voiceCatalogSignature", voiceCatalogSignature).put("voiceCatalogChanged", voiceCatalogChanged)
             .put("loading", engineLoading).put("initialized", ttsInitialized).put("current", current?.name.orEmpty())
             .put("language", current?.locale?.getDisplayName(Locale.SIMPLIFIED_CHINESE).orEmpty())
-            .put("voices", voices).put("rate", voiceRate()).put("message", reason).put("diagnostics", diagnostics.joinToString("\n"))
+            .put("voices", voices).put("rate", voiceRate()).put("message", reason.ifBlank { engineMessage }).put("diagnostics", diagnostics.joinToString("\n"))
     }
     internal fun sendVoiceSettings(reason: String = "") { listener?.onVoiceSettings(voiceSettings(reason)) }
     internal fun selectEngine(name: String) {
-        if (name.isBlank() || installedEngines.any { it.name == name }) switchEngine(name)
-        else sendVoiceSettings("未找到该引擎，请刷新列表后重试。")
+        installedEngines = discoverEngines()
+        val selected = OfflineEngineSelection.resolve(name, systemDefaultEngine(), installedEngines.map { it.name }.toSet())
+        if (selected.available) switchEngine(selected.packageName)
+        else {
+            stopPlayback("所选引擎不可用，朗读已停止。")
+            ++engineGeneration; tts?.shutdown(); tts = null; ttsReady = false; ttsInitialized = false; engineLoading = false
+            engineStatus = "selection-rejected"; voiceCatalogSignature = ""; voiceCatalogChanged = false
+            engineMessage = "未找到所选包中已启用且可访问的 TTS 服务，已拒绝切换；保留原选择。请安装或启用该引擎后重试。"
+            sendVoiceSettings()
+        }
     }
     internal fun configureVoice(name: String, rate: Float, stopCurrent: Boolean = true): Boolean {
         val engine = tts ?: return false
-        val voice = offlineVoices().firstOrNull { it.name == name } ?: return false
         if (stopCurrent) stopPlayback("更改音色，朗读已停止。")
         ttsReady = false
-        if (engine.setVoice(voice) != TextToSpeech.SUCCESS || engine.setSpeechRate(rate) != TextToSpeech.SUCCESS || engine.setAudioAttributes(attributes) != TextToSpeech.SUCCESS) return false
-        val actual = engine.voice ?: return false
-        if (actual.name != voice.name || actual.isNetworkConnectionRequired || actual.features.orEmpty().contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED)) return false
+        val voice = offlineVoices().firstOrNull { it.name == name } ?: return voiceConfigurationFailed()
+        if (engine.setVoice(voice) != TextToSpeech.SUCCESS || engine.setSpeechRate(rate) != TextToSpeech.SUCCESS || engine.setAudioAttributes(attributes) != TextToSpeech.SUCCESS) return voiceConfigurationFailed()
+        val actual = engine.voice ?: return voiceConfigurationFailed()
+        if (actual.name != voice.name || actual.locale != voice.locale || actual.isNetworkConnectionRequired ||
+            actual.features.orEmpty().contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED) ||
+            offlineVoices().none { it.name == actual.name && it.locale == actual.locale }) return voiceConfigurationFailed()
         ttsReady = true
+        configuredVoiceName = voice.name
+        engineStatus = "ready"
+        engineMessage = "当前离线音色已核对；请试听确认使用的是所选引擎。"
         prefs.edit().putString("voice.name.$requestedEngine", voice.name).putFloat("voice.rate", rate).apply()
         return true
+    }
+    private fun voiceConfigurationFailed(): Boolean {
+        engineStatus = "voice-unavailable"
+        engineMessage = "所选离线音色设置失败或返回音色不一致，已停止朗读；请检查引擎和模型后重试。"
+        return false
     }
     private fun switchEngine(packageName: String) {
         stopPlayback("切换语音引擎，朗读已停止。")
         val generation = ++engineGeneration
         tts?.shutdown(); tts = null; ttsReady = false; ttsInitialized = false
-        engineLoading = true; requestedEngine = packageName; sendVoiceSettings("正在初始化所选引擎…")
+        installedEngines = discoverEngines()
+        val selected = OfflineEngineSelection.resolve(packageName, systemDefaultEngine(), installedEngines.map { it.name }.toSet())
+        requestedEngine = selected.packageName
+        // Save intent before asynchronous initialization; failed/uninstalled selections remain visible on restart.
+        if (requestedEngine.isNotBlank()) prefs.edit().putString("voice.engine", requestedEngine).apply()
+        voiceCatalogSignature = ""; voiceCatalogChanged = false
+        engineLoading = false
+        if (!selected.available) {
+            engineStatus = "unavailable"
+            engineMessage = if (requestedEngine.isBlank()) "没有可用的系统默认 TTS 引擎，请手动选择已安装引擎。"
+                else "所选引擎 $requestedEngine 未安装、已停用或未提供可访问的 TTS 服务。已保留选择，未改用其他引擎。"
+            sendVoiceSettings()
+            return
+        }
+        engineLoading = true; engineStatus = "initializing"
+        engineMessage = "正在连接所选引擎 $requestedEngine…"; sendVoiceSettings()
         try {
             val init = TextToSpeech.OnInitListener { status -> finishEngineInit(generation, status) }
-            tts = AndroidOfflineSpeechEngine(if (packageName.isBlank()) TextToSpeech(applicationContext, init) else TextToSpeech(applicationContext, init, packageName))
-            installedEngines = tts?.engines.orEmpty().sortedBy { it.label.toString() }
-            if (packageName.isNotBlank() && installedEngines.none { it.name == packageName }) { switchEngine(""); return }
+            // Public Android API may perform its own fallback; never label the requested package as verified binding.
+            tts = AndroidOfflineSpeechEngine(TextToSpeech(applicationContext, init, requestedEngine))
         } catch (_: Exception) {
-            ++engineGeneration; engineLoading = false; tts?.shutdown(); tts = null
-            sendVoiceSettings("引擎服务无法启动，请选择其他已安装引擎。")
-            if (request != null) failQueue("引擎服务无法启动。")
+            failEngineInitialization("所选引擎服务无法启动，已保留选择；请重试或手动选择其他引擎。")
             return
         }
         main.postDelayed({ if (generation == engineGeneration && engineLoading && !destroyed) {
-            ++engineGeneration; tts?.shutdown(); tts = null; engineLoading = false
-            sendVoiceSettings("引擎初始化超时，请重试或切换其他已安装引擎。")
-            if (request != null) failQueue("引擎初始化超时，朗读已停止。")
+            failEngineInitialization("所选引擎初始化超时，已保留选择；请打开该引擎检查中文模型后重试。")
         } }, 12000)
+    }
+    private fun failEngineInitialization(reason: String) {
+        ++engineGeneration; engineLoading = false; ttsReady = false; ttsInitialized = false
+        tts?.shutdown(); tts = null; engineStatus = "error"; engineMessage = reason
+        sendVoiceSettings()
+        if (request != null) failQueue(reason)
     }
     private fun finishEngineInit(generation: Int, status: Int) {
         main.post {
             if (destroyed || generation != engineGeneration) return@post
-            engineLoading = false; installedEngines = tts?.engines.orEmpty().sortedBy { it.label.toString() }
-            if (requestedEngine.isBlank()) requestedEngine = tts?.defaultEngine.orEmpty()
-            ttsInitialized = status == TextToSpeech.SUCCESS
+            engineLoading = false; installedEngines = discoverEngines()
+            if (status != TextToSpeech.SUCCESS || installedEngines.none { it.name == requestedEngine }) {
+                failEngineInitialization("所选引擎初始化失败或已不可用，已保留选择；请检查引擎后重试。")
+                return@post
+            }
+            ttsInitialized = true
             if (ttsInitialized) {
                 tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                     override fun onStart(utteranceId: String?) { main.post { if (generation == engineGeneration) speechEvent(utteranceId, "started") } }
@@ -365,13 +430,23 @@ class OfflineSpeechService : Service() {
                     @Deprecated("Required legacy callback") override fun onError(utteranceId: String?) { main.post { if (generation == engineGeneration) speechEvent(utteranceId, "error") } }
                     override fun onError(utteranceId: String?, errorCode: Int) { main.post { if (generation == engineGeneration) speechEvent(utteranceId, "error", errorCode) } }
                 })
-                prefs.edit().putString("voice.engine", requestedEngine).apply()
+                val records = tts?.voices.orEmpty().map { "${it.name}|${it.locale.toLanguageTag()}|${it.isNetworkConnectionRequired}|${it.features.orEmpty().sorted().joinToString(",")}" }
+                voiceCatalogSignature = OfflineEngineSelection.catalogSignature(records)
+                val previousSignature = prefs.getString("voice.catalog.$requestedEngine", "").orEmpty()
+                voiceCatalogChanged = previousSignature.isNotBlank() && previousSignature != voiceCatalogSignature
+                // Catalog fingerprints are diagnostics, not proof of the remote service's package identity.
+                prefs.edit().putString("voice.catalog.$requestedEngine", voiceCatalogSignature).apply()
                 val saved = prefs.getString("voice.name.$requestedEngine", null)
                 val voices = offlineVoices()
                 val choice = voices.firstOrNull { it.name == saved } ?: voices.firstOrNull()
                 if (choice != null) configureVoice(choice.name, voiceRate(), false)
             }
-            sendVoiceSettings(if (ttsReady) "" else if (!ttsInitialized) "引擎初始化失败，请重试或选择其他已安装引擎。" else "未找到可用的离线中文语音，请在系统 TTS 设置检查语音包。")
+            engineStatus = if (ttsReady) "ready" else "voice-unavailable"
+            engineMessage = if (ttsReady) {
+                (if (voiceCatalogChanged) "引擎返回的音色列表已变化。" else "") +
+                    "已按所选引擎发起连接并核对当前离线音色；实际绑定包名无法由 Android 公开接口确认，请试听。"
+            } else "所选引擎未返回可用或可确认的离线中文音色，已保留选择；请检查模型后重试。"
+            sendVoiceSettings()
             if (request != null && phase != "paused") playCurrent()
         }
     }
