@@ -1,5 +1,6 @@
 package org.inkdock.reader
 
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -162,7 +163,7 @@ class OfflineSpeechService : Service() {
         releaseAudio()
         publishState()
         if (foregroundService) { stopForeground(STOP_FOREGROUND_DETACH); foregroundService = false }
-        manager.notify(NOTIFICATION, notification())
+        notifyMediaSession()
     }
     internal fun resumePlayback() {
         if (request == null || phase != "paused") return
@@ -272,11 +273,20 @@ class OfflineSpeechService : Service() {
             .addAction(Notification.Action.Builder(android.R.drawable.ic_menu_close_clear_cancel, "停止", action(ACTION_STOP, 2)).build())
             .setStyle(Notification.MediaStyle().setMediaSession(session.sessionToken).setShowActionsInCompactView(0, 1)).build()
     }
+    // Android 13+ exempts media-session notifications from POST_NOTIFICATIONS:
+    // https://developer.android.com/develop/ui/views/notifications/notification-permission#media-sessions
+    // This helper posts only notification()'s MediaStyle with our live MediaSession token;
+    // do not reuse it for ordinary notifications, which need their own permission handling.
+    @SuppressLint("NotificationPermission")
+    private fun notifyMediaSession() {
+        session.isActive = true
+        manager.notify(NOTIFICATION, notification())
+    }
     private fun updateMedia() {
         val state = when { request == null -> PlaybackState.STATE_STOPPED; phase == "paused" -> PlaybackState.STATE_PAUSED; phase == "started" -> PlaybackState.STATE_PLAYING; else -> PlaybackState.STATE_BUFFERING }
         session.setPlaybackState(PlaybackState.Builder().setActions(PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or PlaybackState.ACTION_PLAY_PAUSE or PlaybackState.ACTION_STOP)
             .setState(state, PlaybackState.PLAYBACK_POSITION_UNKNOWN, if (phase == "started") voiceRate() else 0f).build())
-        if (request != null) { session.isActive = true; manager.notify(NOTIFICATION, notification()) }
+        if (request != null) { session.isActive = true; notifyMediaSession() }
     }
     private fun emitSpeech(update: SpeechTracker.Update, reason: String) {
         val line = "${update.phase} chars=${update.characters} elapsed=${update.elapsedMs}ms error=${update.errorCode ?: "none"}"
