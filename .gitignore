@@ -6,3 +6,9 @@ node_modules/
 *.jks
 *.keystore
 .DS_Store
+
+__pycache__/
+*.pyc
+app/src/main/jniLibs/
+app/src/main/assets/kokoro-native-build.json
+app/src/main/assets/licenses/kokoro-native/
