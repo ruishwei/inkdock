@@ -1,2 +1,15 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=3"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'none'; connect-src 'none'"><title>InkDock</title><link rel="stylesheet" href="vendor/katex.css"><link rel="stylesheet" href="reader.css"></head>
-<body><header><button id="open">导入</button><button id="tocButton">目录</button><button id="smaller" aria-label="缩小字号">A−</button><button id="larger" aria-label="放大字号">A+</button><button id="theme">夜间</button><button id="speak">朗读</button><button id="stop">停止</button></header><nav id="toc" hidden aria-label="章节目录"></nav><main id="content"></main><footer><button id="prev">上一组</button><span id="status"></span><button id="next">下一组</button></footer><script src="vendor/marked.js"></script><script src="vendor/purify.js"></script><script src="vendor/katex.js"></script><script src="engine.js"></script><script src="reader.js"></script></body></html>
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=3,viewport-fit=cover"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'none'; connect-src 'none'"><title>InkDock</title><link rel="stylesheet" href="vendor/katex.css"><link rel="stylesheet" href="reader.css"></head>
+<body>
+<main id="content"></main>
+<footer><button id="prev">上一组</button><span id="status"></span><button id="next">下一组</button></footer>
+<nav id="tocPanel" class="panel" hidden aria-label="章节目录"><div class="panel-heading"><strong>目录</strong><button id="closeToc">关闭</button></div><div id="toc"></div></nav>
+<section id="voicePanel" class="panel" hidden aria-label="朗读设置"><div class="panel-heading"><strong>朗读设置</strong><button id="closeVoice">关闭</button></div>
+<p id="voiceEngine">语音引擎初始化中…</p><p id="voiceCurrent"></p>
+<label for="voiceChoice">已安装的离线中文音色</label><select id="voiceChoice"></select>
+<label for="voiceRate">语速 <output id="rateValue">1.00×</output></label><input id="voiceRate" type="range" min="0.5" max="1.5" step="0.05" value="1">
+<p id="voiceStatus" role="status"></p><div class="voice-actions"><button id="saveVoice">保存设置</button><button id="previewVoice">保存并试听</button><button id="voiceStop">停止</button></div>
+<p class="hint">中文正文选中文音色。自然度和情感由手机语音引擎决定，改语言或语速不会自动变成有感情的朗读。这里只使用已安装的离线音色，不下载或调用在线服务。</p>
+</section>
+<div id="toolbar" role="toolbar" aria-label="阅读工具"><button id="open">导入</button><button id="tocButton">目录</button><button id="smaller" aria-label="缩小字号">A−</button><button id="larger" aria-label="放大字号">A+</button><button id="theme">夜间</button><button id="speak">朗读</button><button id="stop">停止</button><button id="voiceSettings">声音</button><span class="gesture-hint">下划显示工具 · 上划收起 · 正文右滑目录</span></div>
+<button id="showTools" hidden aria-label="显示阅读工具">工具</button>
+<script src="vendor/marked.js"></script><script src="vendor/purify.js"></script><script src="vendor/katex.js"></script><script src="engine.js"></script><script src="gestures.js"></script><script src="reader.js"></script></body></html>
