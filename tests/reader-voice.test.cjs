@@ -57,7 +57,8 @@ test('real reader splitting uses 600 cloud units and preserves synthetic Unicode
   assert.ok(parts.every(part=>!/[\uD800-\uDBFF]$/.test(part)&&!/[\uDC00-\uDFFF]/.test(part[0])));
  }
  h.state();const offline=h.read('speechParts(testText)');
- assert.ok(offline.some(part=>part.length>600));assert.ok(offline.every(part=>part.length<=2800));
+ assert.ok(offline[0].length<=120);assert.ok(offline.slice(1).every(part=>part.length<=360));
+ assert.equal(offline.join(''),h.context.testText);
 });
 
 test('source changes and cloud controls stop current reading before native routing',()=>{
@@ -98,6 +99,8 @@ test('offline sends complete selection once and never advances through WebView c
  h.start('合成测试句。'.repeat(800));
  const request=h.calls.find(call=>call[0]==='queue')[1];
  assert.ok(request.entries.length>1);
+ assert.ok(request.entries[0].text.length<=120);
+ assert.ok(request.entries.slice(1).every(part=>part.text.length<=360));
  assert.equal(request.entries.map(part=>part.text).join(''),'合成测试句。'.repeat(800));
  assert.ok(request.entries.every(part=>part.block===-1));
  h.context.onOfflineQueueStatus({queueId:request.queueId,phase:'started',block:-1});
@@ -114,6 +117,28 @@ test('offline stop rejects stale updates and explicit restore accepts service sn
  h.context.onOfflineQueueStatus({queueId:request.queueId,phase:'started'});assert.equal(h.read('playing'),false);
  h.context.onOfflineQueueStatus({queueId:'restored',phase:'paused',restore:true});assert.equal(h.read('offlineQueueId'),'restored');
  h.context.onOfflineQueueStatus({phase:'error',restore:true});assert.equal(h.read('offlineQueueId'),null);assert.equal(h.read('playing'),false);
+});
+
+test('offline full queue shortens only its first utterance and keeps paragraph anchors',()=>{
+ const h=readerHarness();h.state();h.context.Native.speakOfflineQueue=payload=>h.calls.push(['queue',JSON.parse(payload)]);
+ h.context.testBlocks=['skipped before current','开头。  '+'甲'.repeat(800),'','乙'.repeat(720)];
+ h.read('book={blocks:testBlocks.map(()=>({}))};current=1;blockSpeech=index=>testBlocks[index]');
+ h.start('');const entries=h.calls.find(call=>call[0]==='queue')[1].entries;
+ assert.equal(entries[0].text,'开头。  ');assert.equal(entries[0].block,1);
+ assert.ok(entries[0].text.length<=120);assert.ok(entries.slice(1).every(entry=>entry.text.length<=360));
+ assert.equal(entries.filter(entry=>entry.block===1).map(entry=>entry.text).join(''),h.context.testBlocks[1]);
+ assert.equal(entries.filter(entry=>entry.block===3).map(entry=>entry.text).join(''),h.context.testBlocks[3]);
+ assert.equal(entries.find(entry=>entry.block===3).text.length,360);
+ assert.ok(entries.every(entry=>[1,3].includes(entry.block)));
+});
+
+test('offline queue skips whitespace-only slices and retains all spoken text',()=>{
+ const h=readerHarness();h.state();h.context.Native.speakOfflineQueue=payload=>h.calls.push(['queue',JSON.parse(payload)]);
+ h.start('A sentence. '+' '.repeat(1000)+'Next sentence.');
+ const entries=h.calls.find(call=>call[0]==='queue')[1].entries;
+ assert.ok(entries.every(entry=>entry.text.trim()&&entry.block===-1));
+ assert.equal(entries.map(entry=>entry.text).join('').replace(/\s/g,''),'Asentence.Nextsentence.');
+ assert.ok(entries[0].text.length<=120);assert.ok(entries.slice(1).every(entry=>entry.text.length<=360));
 });
 
 test('import closes more panel and reports native Back state before picker launch',()=>{
