@@ -1,0 +1,15 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- This engine exists only in the separately installed instrumentation APK. -->
+    <application android:label="InkDock synthetic regression tests">
+        <service
+            android:name="org.inkdock.reader.SilentFixtureTtsService"
+            android:label="InkDock TEST ONLY silent TTS"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.TTS_SERVICE" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <meta-data android:name="android.speech.tts" android:resource="@xml/silent_fixture_tts_engine" />
+        </service>
+    </application>
+</manifest>
