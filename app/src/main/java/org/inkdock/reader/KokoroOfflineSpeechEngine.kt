@@ -142,10 +142,10 @@ internal class KokoroOfflineSpeechEngine(private val store: KokoroModelStore,
                 val began = SystemClock.elapsedRealtime()
                 main.post { if (alive(epoch)) pipeline.synthesisStarted(token) }
                 val callbackSamples = AtomicLong(0)
-                val audio = requireNotNull(model).generateWithCallback(text, sid, speed) { samples ->
+                val audio = requireNotNull(model).generateWithCallback(text, sid, speed, SherpaTtsCallback { samples ->
                     val count = callbackSamples.addAndGet(samples.size.toLong())
                     if (alive(epoch) && count <= PcmBudget.MAX_SAMPLES) 1 else 0
-                }
+                })
                 if (!alive(epoch)) return@Runnable
                 check(callbackSamples.get() <= PcmBudget.MAX_SAMPLES) { "PCM callback limit" }
                 val durationMs = audio.samples.size.toLong() * 1000 / audio.sampleRate
