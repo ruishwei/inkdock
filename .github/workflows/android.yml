@@ -62,8 +62,46 @@ jobs:
           "$SDKMANAGER" --version
       - name: Install Android platform
         # Use runner's existing SDK licenses; do not silently accept new terms.
-        run: sdkmanager --sdk_root="$ANDROID_HOME" 'platforms;android-35' 'build-tools;35.0.0' </dev/null
-      - run: gradle --no-daemon :app:assembleDebug :app:lintDebug
+        run: sdkmanager --sdk_root="$ANDROID_HOME" 'platforms;android-35' 'build-tools;35.0.0' 'platform-tools' 'emulator' 'system-images;android-35;google_apis;x86_64' </dev/null
+      - run: gradle --no-daemon :app:assembleDebug :app:lintDebug :app:testDebugUnitTest :app:assembleDebugAndroidTest
+      - name: Check existing emulator acceleration access
+        run: |
+          if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+            echo '::error::Android 15 regression blocked: runner lacks existing read/write access to /dev/kvm. Device permissions were not changed.'
+            exit 1
+          fi
+      - name: Run Android 15 platform Back regression
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          mkdir -p build/android-regression
+          export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          # "no" declines custom hardware configuration; SDK license terms are not accepted here.
+          printf 'no\n' | avdmanager create avd --force --name inkdock-api35 --package 'system-images;android-35;google_apis;x86_64' --device pixel_6
+          emulator -avd inkdock-api35 -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect > build/android-regression/emulator.log 2>&1 &
+          EMULATOR_PID=$!
+          trap 'adb logcat -d > build/android-regression/logcat.txt 2>&1 || true; adb shell dumpsys activity activities > build/android-regression/activities.txt 2>&1 || true; adb emu kill || true; kill "$EMULATOR_PID" 2>/dev/null || true' EXIT
+          timeout 300 adb wait-for-device
+          timeout 300 bash -c 'until [[ "$(adb shell getprop sys.boot_completed | tr -d "\r")" == "1" ]]; do sleep 2; done'
+          adb shell input keyevent 82
+          adb shell settings put global window_animation_scale 0
+          adb shell settings put global transition_animation_scale 0
+          adb shell settings put global animator_duration_scale 0
+          adb shell getprop ro.build.version.sdk | tee build/android-regression/api-level.txt
+          test "$(adb shell getprop ro.build.version.sdk | tr -d '\r')" = 35
+          adb logcat -c
+          gradle --no-daemon :app:connectedDebugAndroidTest --stacktrace 2>&1 | tee build/android-regression/instrumentation-gradle.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: InkDock-Android15-regression
+          path: |
+            build/android-regression/
+            app/build/reports/androidTests/
+            app/build/outputs/androidTest-results/
+            app/build/reports/tests/
+            app/build/test-results/
+          if-no-files-found: warn
       - uses: actions/upload-artifact@v4
         with:
           name: InkDock-debug-apk
