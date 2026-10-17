@@ -43,6 +43,8 @@ class MainActivity : Activity() {
     private val speech = SpeechTracker()
     private val mainHandler = Handler(Looper.getMainLooper())
     private val speechDiagnostics = ArrayDeque<String>()
+    private var returnFromKokoroSetup = false
+    private var kokoroSetupResumeRequested = false
     private var panelOpen = false
     private var backCallback: OnBackInvokedCallback? = null
     private var selectedCloud: CloudVoiceProvider? = null // Every launch defaults to offline.
@@ -81,6 +83,7 @@ class MainActivity : Activity() {
             if (ready && !documentShown) showDocument()
             sendVoiceSettings()
             if (ready && foreground) offline?.sendSnapshot()
+            restoreKokoroAfterSetup()
         }
         override fun onServiceDisconnected(name: ComponentName?) {
             offline = null
@@ -101,6 +104,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        returnFromKokoroSetup = savedInstanceState?.getBoolean("returnFromKokoroSetup") ?: false
         web = WebView(this)
         web.setBackgroundColor(0xfffaf7ef.toInt())
         // Android 15 enforces edge-to-edge. Keep controls outside system bars.
@@ -288,8 +292,14 @@ class MainActivity : Activity() {
         }
     }
     inner class Bridge {
+        @JavascriptInterface fun openKokoroSetup() = runOnUiThread {
+            val service = offline ?: run { toast("正在连接语音服务，请稍后打开模型管理。"); return@runOnUiThread }
+            stopPlayback(); service.releaseKokoroForMaintenance()
+            returnFromKokoroSetup = true; kokoroSetupResumeRequested = false
+            startActivity(Intent(this@MainActivity, KokoroSetupActivity::class.java))
+        }
         @JavascriptInterface fun panelState(open: Boolean) = runOnUiThread { setPanelOpen(open) }
-        @JavascriptInterface fun ready() = runOnUiThread { ready = true; showDocument(); sendVoiceSettings(); offline?.sendSnapshot(); setPanelOpen(false) }
+        @JavascriptInterface fun ready() = runOnUiThread { ready = true; showDocument(); sendVoiceSettings(); offline?.sendSnapshot(); setPanelOpen(false); restoreKokoroAfterSetup() }
         @JavascriptInterface fun openDocument() = runOnUiThread {
             val picker = Intent(Intent.ACTION_OPEN_DOCUMENT).apply { addCategory(Intent.CATEGORY_OPENABLE); type = "*/*" }
             startActivityForResult(picker, OPEN)
@@ -355,6 +365,22 @@ class MainActivity : Activity() {
         super.onResume(); foreground = true
         offline?.setListener(offlineListener)
         if (ready) offline?.sendSnapshot()
+        if (returnFromKokoroSetup) kokoroSetupResumeRequested = true
+        restoreKokoroAfterSetup()
+    }
+    private fun restoreKokoroAfterSetup() {
+        // Setup may outlive Activity recreation or an asynchronous Service/WebView connection.
+        // Never reacquire the model while the setup Activity is still in front.
+        if (!returnFromKokoroSetup || !kokoroSetupResumeRequested || !foreground || !ready) return
+        val service = offline ?: return
+        returnFromKokoroSetup = false; kokoroSetupResumeRequested = false
+        service.resumeKokoroAfterMaintenance()
+        web.evaluateJavascript("openPanel('voicePanel')", null)
+        service.sendVoiceSettings()
+    }
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean("returnFromKokoroSetup", returnFromKokoroSetup)
+        super.onSaveInstanceState(outState)
     }
     override fun onPause() {
         foreground = false

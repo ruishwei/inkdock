@@ -38,7 +38,7 @@ class OfflineVoiceCenter(private val activity: Activity, private val refresh: ()
         }
         fun paragraph(value: String) { body.addView(TextView(activity).apply { text = value; textSize = 15f; setPadding(0, 12, 0, 12) }) }
         fun action(label: String, click: () -> Unit) { body.addView(Button(activity).apply { text = label; setOnClickListener { click() } }) }
-        paragraph("本版使用独立的 Android TTS 引擎，尚未内置神经模型运行库。下载、进度、取消、占用空间和删除模型均由所安装的引擎应用管理；这里只负责安装指引、打开管理界面和接回朗读。打开网站会使用手机浏览器，不发送书中文字。")
+        paragraph("此页面只配置外部 Android TTS 引擎；内置Kokoro实验模型请返回声音设置，使用专门的下载与管理入口。下载、进度、取消、占用空间和删除模型均由所安装的引擎应用管理；这里只负责安装指引、打开管理界面和接回朗读。打开网站会使用手机浏览器，不发送书中文字。")
         paragraph("① 获取中文离线引擎\nKokoro 中文 v1.1：优先选择名称含 Chinese / multi-lang-v1_1 的模型，不能选仅 English 的包。sherpa 官方也提供带模型的 TTS Engine APK，注意选择 arm64-v8a 和中文版本，不要选仅供演示的 TTS APK。下载及安装由你在浏览器/系统安装器中确认。")
         action("打开 sherpa 官方 TTS 引擎下载目录") { website(OfflineVoiceCatalog.SHERPA_ENGINES) }
         action("查看 Kokoro 中文模型与音色说明") { website(OfflineVoiceCatalog.KOKORO_GUIDE) }

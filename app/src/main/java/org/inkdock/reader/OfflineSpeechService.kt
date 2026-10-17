@@ -53,6 +53,9 @@ class OfflineSpeechService : Service() {
     private var engineGeneration = 0
     private var requestedEngine = ""
     private var engineLoading = false
+    private var engineInitRequestedAt = -1L
+    private var engineInitElapsedMs: Long? = null
+    private var engineInitDiagnostic = "engine_init not_requested"
     private data class DeclaredEngine(val name: String, val label: String)
     private var installedEngines: List<DeclaredEngine> = emptyList()
     private var engineStatus = "uninitialized"
@@ -222,14 +225,14 @@ class OfflineSpeechService : Service() {
         else {
             speechTimers.postDelayed({ if (utteranceId == token) speech.queuedTimeout(token, SystemClock.elapsedRealtime())?.let {
                 utteranceId = null; engine.stop(); emitSpeech(it, speechError(it.errorCode)); failQueue(speechError(it.errorCode))
-            } }, 12000)
+            } }, if (requestedEngine == KokoroOfflineSpeechEngine.ID) 120000 else 12000)
             speechTimers.postDelayed({ if (utteranceId == token) { failQueue("当前片段超过 20 分钟仍未完成，已停止以释放后台资源。") } }, MAX_SEGMENT_TIME_MS)
         }
     }
     private fun speechEvent(id: String?, event: String, code: Int? = null) {
         if (id == null || id != utteranceId || request == null || phase == "paused") return
         val update = speech.event(id, event, SystemClock.elapsedRealtime(), code) ?: return
-        val eventMessage = when (event) { "started" -> "离线引擎报告开始朗读。"; "done" -> "当前片段完成。"; "error" -> speechError(code); else -> "语音引擎中断，朗读已停止。" }
+        val eventMessage = when (event) { "started" -> "离线引擎报告开始朗读；回调耗时不代表实际首声延迟。"; "done" -> "当前片段完成。"; "error" -> speechError(code); else -> "语音引擎中断，朗读已停止。" }
         emitSpeech(update, eventMessage)
         when (event) {
             "started" -> { phase = "started"; message = eventMessage; publishState() }
@@ -302,11 +305,15 @@ class OfflineSpeechService : Service() {
         if (request != null) { session.isActive = true; notifyMediaSession() }
     }
     private fun emitSpeech(update: SpeechTracker.Update, reason: String) {
-        val line = "${update.phase} chars=${update.characters} elapsed=${update.elapsedMs}ms error=${update.errorCode ?: "none"}"
+        // Existing elapsedMs starts at speech.begin (submission preparation), not audible output.
+        val timing = if (update.phase == "started") "request_to_onStart_callback=${update.elapsedMs}ms (not_first_audio)"
+            else "elapsed=${update.elapsedMs}ms"
+        val line = "${update.phase} chars=${update.characters} $timing error=${update.errorCode ?: "none"}"
         diagnostics.addLast(line); while (diagnostics.size > 12) diagnostics.removeFirst()
         Log.i("InkDockTTS", line) // No text, document title, or credential logging.
         listener?.onSpeechStatus(JSONObject().put("source", "offline").put("requestId", update.requestId).put("phase", update.phase)
             .put("characters", update.characters).put("elapsedMs", update.elapsedMs).put("message", reason)
+            .put("timingBasis", "speech_request_to_engine_callback_not_audible_output")
             .put("errorCode", update.errorCode ?: JSONObject.NULL))
     }
     private fun offlineVoices(): List<Voice> = if (!ttsInitialized) emptyList() else tts?.voices.orEmpty().filter {
@@ -315,13 +322,18 @@ class OfflineSpeechService : Service() {
     }.sortedWith(compareBy({ it.locale.toLanguageTag() }, { it.name }))
     private fun voiceRate() = prefs.getFloat("voice.rate", 1f).coerceIn(0.5f, 1.5f)
     @Suppress("DEPRECATION")
-    private fun discoverEngines(): List<DeclaredEngine> = try {
-        packageManager.queryIntentServices(Intent(TextToSpeech.Engine.INTENT_ACTION_TTS_SERVICE), PackageManager.GET_META_DATA)
-            .mapNotNull { result -> result.serviceInfo?.takeIf { it.exported && it.enabled && it.applicationInfo.enabled &&
-                (it.permission.isNullOrBlank() || checkSelfPermission(it.permission) == PackageManager.PERMISSION_GRANTED) }
-                ?.let { DeclaredEngine(it.packageName, result.loadLabel(packageManager).toString()) } }
-            .distinctBy { it.name }.sortedBy { it.label }
-    } catch (_: RuntimeException) { emptyList() }
+    private fun discoverEngines(): List<DeclaredEngine> {
+        val engines = try {
+            packageManager.queryIntentServices(Intent(TextToSpeech.Engine.INTENT_ACTION_TTS_SERVICE), PackageManager.GET_META_DATA)
+                .mapNotNull { result -> result.serviceInfo?.takeIf { it.exported && it.enabled && it.applicationInfo.enabled &&
+                    (it.permission.isNullOrBlank() || checkSelfPermission(it.permission) == PackageManager.PERMISSION_GRANTED) }
+                    ?.let { DeclaredEngine(it.packageName, result.loadLabel(packageManager).toString()) } }
+                .distinctBy { it.name }
+        } catch (_: RuntimeException) { emptyList() }
+        val native = if (KokoroRepository.runtimeAvailable() && KokoroRepository.get(this).isReady())
+            listOf(DeclaredEngine(KokoroOfflineSpeechEngine.ID, "Kokoro 中文（内置实验）")) else emptyList()
+        return (engines + native).sortedBy { it.label }
+    }
     @Suppress("DEPRECATION")
     private fun systemDefaultEngine(): String = try {
         Settings.Secure.getString(contentResolver, Settings.Secure.TTS_DEFAULT_SYNTH).orEmpty()
@@ -331,22 +343,44 @@ class OfflineSpeechService : Service() {
         val engines = JSONArray(); installedEngines.forEach { engines.put(JSONObject().put("name", it.name).put("label", it.label)) }
         val voices = JSONArray(); offlineVoices().forEach { voices.put(JSONObject().put("name", it.name).put("language", it.locale.getDisplayName(Locale.SIMPLIFIED_CHINESE))) }
         val current = if (ttsReady) tts?.voice else null
+        val nativeBinding = requestedEngine == KokoroOfflineSpeechEngine.ID && ttsInitialized && tts is KokoroOfflineSpeechEngine
         return JSONObject().put("engine", installedEngines.firstOrNull { it.name == requestedEngine }?.label ?: requestedEngine)
             .put("enginePackage", requestedEngine).put("requestedEngine", requestedEngine).put("engines", engines).put("source", "offline")
-            .put("engineState", engineStatus).put("engineStatus", "Android 公开接口无法确认实际绑定的引擎包名；若声音不符，请停止朗读并检查系统引擎。")
-            .put("engineVerified", false).put("engineBindingVerified", false)
+            .put("engineState", engineStatus).put("engineStatus", if (requestedEngine == KokoroOfflineSpeechEngine.ID)
+                "内置 Kokoro 在本应用内加载已校验的模型，不会改用系统 TTS 引擎。"
+                else "Android 公开接口无法确认实际绑定的引擎包名；若声音不符，请停止朗读并检查系统引擎。")
+            .put("engineVerified", nativeBinding).put("engineBindingVerified", nativeBinding)
             .put("voiceCatalogSignature", voiceCatalogSignature).put("voiceCatalogChanged", voiceCatalogChanged)
+            .put("engineInitElapsedMs", engineInitElapsedMs ?: JSONObject.NULL)
+            .put("engineInitTimingBasis", "constructor_request_to_onInit_callback_not_audible_output")
             .put("loading", engineLoading).put("initialized", ttsInitialized).put("current", current?.name.orEmpty())
             .put("language", current?.locale?.getDisplayName(Locale.SIMPLIFIED_CHINESE).orEmpty())
-            .put("voices", voices).put("rate", voiceRate()).put("message", reason.ifBlank { engineMessage }).put("diagnostics", diagnostics.joinToString("\n"))
+            .put("voices", voices).put("rate", voiceRate()).put("message", reason.ifBlank { engineMessage })
+            .put("diagnostics", (listOf(engineInitDiagnostic) + diagnostics).joinToString("\n"))
     }
     internal fun sendVoiceSettings(reason: String = "") { listener?.onVoiceSettings(voiceSettings(reason)) }
+    internal fun releaseKokoroForMaintenance() {
+        if (requestedEngine != KokoroOfflineSpeechEngine.ID) return
+        stopPlayback("管理内置模型，朗读已停止。")
+        ++engineGeneration; tts?.shutdown(); tts = null
+        ttsReady = false; ttsInitialized = false; engineLoading = false; configuredVoiceName = ""
+        engineStatus = "maintenance"
+        engineMessage = "内置模型已暂停使用；返回后将重新检查已选择的 Kokoro 模型。"
+        sendVoiceSettings()
+    }
+    internal fun resumeKokoroAfterMaintenance() {
+        if (requestedEngine == KokoroOfflineSpeechEngine.ID && engineStatus == "maintenance") switchEngine(requestedEngine)
+    }
     internal fun selectEngine(name: String) {
         installedEngines = discoverEngines()
         val selected = OfflineEngineSelection.resolve(name, systemDefaultEngine(), installedEngines.map { it.name }.toSet())
         if (selected.available) switchEngine(selected.packageName)
         else {
             stopPlayback("所选引擎不可用，朗读已停止。")
+            if (engineLoading && engineInitElapsedMs == null) {
+                engineInitDiagnostic = "engine_init cancelled_before_onInit"
+                Log.i("InkDockTTS", engineInitDiagnostic)
+            }
             ++engineGeneration; tts?.shutdown(); tts = null; ttsReady = false; ttsInitialized = false; engineLoading = false
             engineStatus = "selection-rejected"; voiceCatalogSignature = ""; voiceCatalogChanged = false
             engineMessage = "未找到所选包中已启用且可访问的 TTS 服务，已拒绝切换；保留原选择。请安装或启用该引擎后重试。"
@@ -378,6 +412,7 @@ class OfflineSpeechService : Service() {
     private fun switchEngine(packageName: String) {
         stopPlayback("切换语音引擎，朗读已停止。")
         val generation = ++engineGeneration
+        engineInitRequestedAt = -1L; engineInitElapsedMs = null; engineInitDiagnostic = "engine_init not_requested"
         tts?.shutdown(); tts = null; ttsReady = false; ttsInitialized = false
         installedEngines = discoverEngines()
         val selected = OfflineEngineSelection.resolve(packageName, systemDefaultEngine(), installedEngines.map { it.name }.toSet())
@@ -389,6 +424,7 @@ class OfflineSpeechService : Service() {
         if (!selected.available) {
             engineStatus = "unavailable"
             engineMessage = if (requestedEngine.isBlank()) "没有可用的系统默认 TTS 引擎，请手动选择已安装引擎。"
+                else if (requestedEngine == KokoroOfflineSpeechEngine.ID) "所选内置 Kokoro 模型尚未就绪或原生运行库不可用。已保留选择，请打开内置模型管理检查；未改用系统引擎。"
                 else "所选引擎 $requestedEngine 未安装、已停用或未提供可访问的 TTS 服务。已保留选择，未改用其他引擎。"
             sendVoiceSettings()
             return
@@ -396,26 +432,46 @@ class OfflineSpeechService : Service() {
         engineLoading = true; engineStatus = "initializing"
         engineMessage = "正在连接所选引擎 $requestedEngine…"; sendVoiceSettings()
         try {
+            engineInitRequestedAt = SystemClock.elapsedRealtime()
+            engineInitDiagnostic = "engine_init pending_onInit"
+            Log.i("InkDockTTS", engineInitDiagnostic)
             val init = TextToSpeech.OnInitListener { status -> finishEngineInit(generation, status) }
-            // Public Android API may perform its own fallback; never label the requested package as verified binding.
-            tts = AndroidOfflineSpeechEngine(TextToSpeech(applicationContext, init, requestedEngine))
+            // External Android TTS may perform its own fallback; only our in-process native adapter is verified.
+            tts = if (requestedEngine == KokoroOfflineSpeechEngine.ID) {
+                val nativeEngines = installedEngines.map { declared -> TextToSpeech.EngineInfo().apply {
+                    name = declared.name; label = declared.label
+                } }
+                KokoroOfflineSpeechEngine(KokoroRepository.get(this), KokoroRepository.selected(this), nativeEngines) {
+                    status -> finishEngineInit(generation, status)
+                }
+            } else AndroidOfflineSpeechEngine(TextToSpeech(applicationContext, init, requestedEngine))
         } catch (_: Exception) {
             failEngineInitialization("所选引擎服务无法启动，已保留选择；请重试或手动选择其他引擎。")
             return
         }
         main.postDelayed({ if (generation == engineGeneration && engineLoading && !destroyed) {
             failEngineInitialization("所选引擎初始化超时，已保留选择；请打开该引擎检查中文模型后重试。")
-        } }, 12000)
+        } }, if (requestedEngine == KokoroOfflineSpeechEngine.ID) 120000 else 12000)
     }
     private fun failEngineInitialization(reason: String) {
+        if (engineInitRequestedAt >= 0 && engineInitElapsedMs == null) {
+            val waitMs = (SystemClock.elapsedRealtime() - engineInitRequestedAt).coerceAtLeast(0)
+            engineInitDiagnostic = "engine_init ended_without_onInit wait=${waitMs}ms"
+            Log.i("InkDockTTS", engineInitDiagnostic)
+        }
         ++engineGeneration; engineLoading = false; ttsReady = false; ttsInitialized = false
         tts?.shutdown(); tts = null; engineStatus = "error"; engineMessage = reason
         sendVoiceSettings()
         if (request != null) failQueue(reason)
     }
     private fun finishEngineInit(generation: Int, status: Int) {
+        // Capture callback receipt before the main-thread dispatch; this excludes later voice configuration.
+        val callbackReceivedAt = SystemClock.elapsedRealtime()
         main.post {
             if (destroyed || generation != engineGeneration) return@post
+            engineInitElapsedMs = (callbackReceivedAt - engineInitRequestedAt).coerceAtLeast(0)
+            engineInitDiagnostic = "engine_init request_to_onInit=${engineInitElapsedMs}ms status=$status (not_first_audio)"
+            Log.i("InkDockTTS", engineInitDiagnostic) // No document text, package, or voice identifiers.
             engineLoading = false; installedEngines = discoverEngines()
             if (status != TextToSpeech.SUCCESS || installedEngines.none { it.name == requestedEngine }) {
                 failEngineInitialization("所选引擎初始化失败或已不可用，已保留选择；请检查引擎后重试。")
@@ -444,7 +500,8 @@ class OfflineSpeechService : Service() {
             engineStatus = if (ttsReady) "ready" else "voice-unavailable"
             engineMessage = if (ttsReady) {
                 (if (voiceCatalogChanged) "引擎返回的音色列表已变化。" else "") +
-                    "已按所选引擎发起连接并核对当前离线音色；实际绑定包名无法由 Android 公开接口确认，请试听。"
+                    (if (requestedEngine == KokoroOfflineSpeechEngine.ID) "已加载所选内置 Kokoro 模型并核对当前离线音色，请试听。"
+                    else "已按所选引擎发起连接并核对当前离线音色；实际绑定包名无法由 Android 公开接口确认，请试听。")
             } else "所选引擎未返回可用或可确认的离线中文音色，已保留选择；请检查模型后重试。"
             sendVoiceSettings()
             if (request != null && phase != "paused") playCurrent()
@@ -456,7 +513,8 @@ class OfflineSpeechService : Service() {
         TextToSpeech.ERROR_SYNTHESIS -> "系统引擎合成失败，请换一个已安装的离线中文音色。"
         TextToSpeech.ERROR_SERVICE -> "系统语音服务不可用，请检查 TTS 引擎或重启应用。"
         TextToSpeech.ERROR_NETWORK, TextToSpeech.ERROR_NETWORK_TIMEOUT -> "引擎报告网络错误；本应用仅请求离线音色，请检查语音包。"
-        -1000 -> "语音请求已提交，但 12 秒内没有收到开始回调。请检查系统 TTS 设置。"
+        -1000 -> if (requestedEngine == KokoroOfflineSpeechEngine.ID) "本地模型未在 120 秒内开始播放，请重试或更换音色。"
+            else "语音请求已提交，但 12 秒内没有收到开始回调。请检查系统 TTS 设置。"
         else -> "语音引擎未能完成朗读（错误码 ${code ?: "未知"}）。"
     }
     override fun onDestroy() {
