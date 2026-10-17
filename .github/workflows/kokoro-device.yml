@@ -203,7 +203,7 @@ jobs:
           "$ANDROID_HOME/emulator/emulator" -version > build/kokoro-device/reports/emulator-version.txt
       - name: Download and hash-check only fixed public float/int8 model files
         run: python3 scripts/kokoro-device-models.py download
-      - name: Run real JNI and buffered-playback instrumentation on disposable API 35
+      - name: Run real JNI, buffered playback and float callback latency on disposable API 35
         timeout-minutes: 40
         env:
           INKDOCK_EPHEMERAL_DEVICE_TEST: '1'
@@ -229,6 +229,9 @@ jobs:
             if [[ -n "$EMULATOR_PID" ]]; then kill "$EMULATOR_PID" 2>/dev/null; fi
           }
           trap cleanup EXIT
+          # Preserve the 2-vCPU baseline. A 4-thread model is oversubscribed here;
+          # these measurements do not select an optimal thread count for Y300t.
+          printf '%s\n' '{"api":35,"abi":"x86_64","avdVirtualCpus":2,"avdMemoryMiB":3072,"hostedRunner":"ubuntu-24.04","physicalPhoneMeasurement":false}' > "$REPORTS/benchmark-environment.json"
           emulator -avd inkdock-kokoro-api35 -port 5554 -accel on -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect -memory 3072 -cores 2 -partition-size 4096 > "$REPORTS/emulator.log" 2>&1 &
           EMULATOR_PID=$!
           timeout 180 adb -s emulator-5554 wait-for-device
@@ -258,7 +261,7 @@ jobs:
           # Explicit new test classes only. No cloud provider/test credentials/user text.
           set +e
           timeout 1800 adb -s emulator-5554 shell am instrument -w -r \
-            -e class org.inkdock.reader.KokoroNativeDeviceTest,org.inkdock.reader.KokoroModelTransferDeviceTest,org.inkdock.reader.NativePcmPrefetchDeviceTest \
+            -e class org.inkdock.reader.KokoroNativeDeviceTest,org.inkdock.reader.KokoroModelTransferDeviceTest,org.inkdock.reader.NativePcmPrefetchDeviceTest,org.inkdock.reader.KokoroFloatLatencyBenchmarkDeviceTest \
             -e kokoroVariants float,int8 \
             org.inkdock.reader.test/androidx.test.runner.AndroidJUnitRunner 2>&1 | tee "$REPORTS/instrumentation.txt"
           INSTRUMENTATION_EXIT=${PIPESTATUS[0]}
