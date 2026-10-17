@@ -1,0 +1,120 @@
+name: Kokoro experimental JNI audit
+
+on:
+  push:
+    branches: ['experiment/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kokoro-experiment-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-audit:
+    # Explicitly isolated from the alpha release workflow and main branch.
+    if: startsWith(github.ref, 'refs/heads/experiment/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify existing runner SDK, NDK and JDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Official runner inventory: https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2404-Readme.md
+          # Fail closed. No sdkmanager, package installation, license acceptance,
+          # emulator, /dev/kvm, permission changes, cloud voice calls or model downloads.
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          test -n "$SDK_ROOT"
+          test -f "$SDK_ROOT/platforms/android-35/android.jar"
+          test -x "$SDK_ROOT/build-tools/35.0.0/zipalign"
+          test -x "${JAVA_HOME_17_X64:?Existing runner JDK 17 is required}/bin/java"
+          command -v cmake
+          command -v python3
+          python3 - <<'PY'
+          import importlib.util
+          import os
+          import re
+          spec = importlib.util.spec_from_file_location('kokoro_native', 'scripts/build-kokoro-native.py')
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          ndk = module.find_ndk()
+          print('Using existing NDK:', ndk)
+          print((ndk / 'source.properties').read_text())
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              stream.write('ANDROID_NDK_HOME=' + str(ndk) + '\n')
+              revision = re.search(r'^Pkg.Revision\s*=\s*(.+)$', (ndk / 'source.properties').read_text(), re.M)
+              if not revision:
+                  raise SystemExit('Existing NDK has no revision metadata')
+              stream.write('INKDOCK_NDK_VERSION=' + revision.group(1) + '\n')
+          PY
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_17_X64/bin" >> "$GITHUB_PATH"
+          cmake --version
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Check JavaScript and archive/ELF safety
+        run: |
+          npm ci --ignore-scripts
+          npm run vendor
+          git diff --exit-code -- app/src/main/assets/vendor
+          npm test
+          python3 scripts/build-kokoro-native.py --self-test
+          python3 scripts/test-kokoro-native.py
+      - name: Browser regressions and screenshots
+        run: |
+          npx playwright-core install --with-deps chromium
+          node scripts/browser-smoke.cjs
+          node scripts/test-voice-ui.cjs
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+      - name: Build and inspect pinned JNI for both ABIs
+        run: python3 scripts/build-kokoro-native.py --jobs 2
+      - name: Compile experimental debug APK, lint and unit tests
+        # Disables AGP SDK package auto-download. Uses installed SDK licenses only.
+        run: gradle --no-daemon -Pandroid.builder.sdkDownload=false :app:assembleDebug :app:lintDebug :app:testDebugUnitTest :app:assembleDebugAndroidTest
+      - name: Audit final debug APK bytes and ZIP alignment
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          python3 scripts/build-kokoro-native.py --audit-apk "$APK" | tee build/kokoro-native/audit/apk-audit.txt
+          "$ANDROID_HOME/build-tools/35.0.0/zipalign" -c -P 16 -v 4 "$APK" > build/kokoro-native/audit/apk-zipalign.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" > build/kokoro-native/audit/apk-badging.txt
+          (cd app/build/outputs/apk/debug && sha256sum app-debug.apk > SHA256SUMS.txt)
+      - name: Preserve build and audit evidence
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: InkDock-kokoro-experiment-audit-${{ github.run_id }}
+          path: |
+            build/screenshots/
+            build/kokoro-native/audit/
+            app/src/main/assets/kokoro-native-build.json
+            app/src/main/assets/licenses/kokoro-native/
+            app/src/main/jniLibs/
+            app/build/reports/lint-results-debug.*
+            app/build/intermediates/lint_intermediate_text_report/
+            app/build/reports/tests/
+            app/build/test-results/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Preserve verified experimental debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: InkDock-kokoro-experimental-debug-apk-${{ github.run_id }}
+          path: |
+            app/build/outputs/apk/debug/app-debug.apk
+            app/build/outputs/apk/debug/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14

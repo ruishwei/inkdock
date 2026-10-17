@@ -1,7 +1,9 @@
 name: Android debug
 on:
   push:
+    branches: [main]
   pull_request:
+    branches: [main]
   workflow_dispatch:
     inputs:
       release_version:
@@ -18,6 +20,7 @@ permissions:
   contents: read
 jobs:
   build:
+    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
