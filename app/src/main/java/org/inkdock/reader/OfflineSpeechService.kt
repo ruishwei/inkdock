@@ -40,11 +40,23 @@ class OfflineSpeechService : Service() {
         fun onQueueStatus(state: JSONObject)
         fun onVoiceSettings(state: JSONObject)
         fun onSpeechStatus(state: JSONObject)
+        fun onSleepTimerStatus(state: JSONObject) {}
+        fun onSleepTimerExpired() {}
     }
     inner class LocalBinder : Binder() { val service: OfflineSpeechService get() = this@OfflineSpeechService }
     private val binder = LocalBinder()
     private val main = Handler(Looper.getMainLooper())
     private val speechTimers = Handler(Looper.getMainLooper())
+    private val sleepTimer = SleepTimer()
+    private val sleepTimerHandler = Handler(Looper.getMainLooper())
+    private val sleepTimerTick = object : Runnable {
+        override fun run() {
+            if (destroyed || !checkSleepTimer()) return
+            publishSleepTimer()
+            if (request != null) updateMedia()
+            scheduleSleepTimer()
+        }
+    }
     private val prefs by lazy { getSharedPreferences("reader", MODE_PRIVATE) }
     private val manager by lazy { requireNotNull(getSystemService(NotificationManager::class.java)) }
     private val audio by lazy { requireNotNull(getSystemService(AudioManager::class.java)) }
@@ -66,6 +78,7 @@ class OfflineSpeechService : Service() {
     private var configuredVoiceName = ""
     private var ttsInitialized = false
     private var destroyed = false
+    private var engineReleasedForSleep = false
     private var request: OfflineSpeechRequest? = null
     private var documentId = ""
     private var queueIndex = 0
@@ -138,7 +151,66 @@ class OfflineSpeechService : Service() {
         // Never restart/replay private text after process death or a user Task Manager stop.
         return START_NOT_STICKY
     }
-    internal fun setListener(value: Listener?) { listener = value; if (value != null) sendVoiceSettings() }
+    internal fun setListener(value: Listener?) {
+        listener = value
+        if (value != null) { checkSleepTimer(); sendVoiceSettings(); publishSleepTimer() }
+    }
+    internal fun setSleepTimer(minutes: Int): Boolean {
+        if (destroyed || !sleepTimer.set(minutes, SystemClock.elapsedRealtime())) return false
+        scheduleSleepTimer(); publishSleepTimer(); updateMedia()
+        return true
+    }
+    internal fun cancelSleepTimer() {
+        sleepTimer.cancel(); sleepTimerHandler.removeCallbacksAndMessages(null)
+        publishSleepTimer()
+        if (request != null) updateMedia()
+    }
+    /** Called only for an explicit user play gesture, never async speech/consent callbacks. */
+    internal fun beginUserPlayback(): Boolean {
+        if (destroyed) return false
+        checkSleepTimer()
+        sleepTimer.beginUserPlayback()
+        if (engineReleasedForSleep) { engineReleasedForSleep = false; switchEngine(requestedEngine, preserveTimer = true) }
+        publishSleepTimer()
+        return true
+    }
+    /** Also called before resume, queue submission and asynchronous playback callbacks.
+     * Handler uses uptime, so a sleeping paused device may deliver late; elapsedRealtime remains
+     * authoritative and prevents any expired playback from resuming when the device wakes.
+     */
+    internal fun checkSleepTimer(): Boolean {
+        if (destroyed) return false
+        if (sleepTimer.expire(SystemClock.elapsedRealtime())) {
+            sleepTimerHandler.removeCallbacksAndMessages(null)
+            stopPlayback("定时已到，朗读已停止。", cancelTimer = false)
+            // Shutdown cancels streaming buffers immediately, then releases the native model only
+            // after its in-flight generation has exited. Never free a model under an active JNI call.
+            ++engineGeneration
+            tts?.shutdown(); tts = null
+            ttsReady = false; ttsInitialized = false; engineLoading = false
+            configuredVoiceName = ""; engineReleasedForSleep = true
+            engineStatus = "sleep-timer-expired"; engineMessage = "定时已到，语音资源已释放；再次播放会重新初始化。"
+            listener?.onSleepTimerExpired()
+            publishSleepTimer()
+        }
+        return !sleepTimer.snapshot(SystemClock.elapsedRealtime()).expired
+    }
+    internal fun sleepTimerSnapshot(): JSONObject {
+        checkSleepTimer()
+        return timerJson()
+    }
+    private fun timerJson(): JSONObject {
+        val state = sleepTimer.snapshot(SystemClock.elapsedRealtime())
+        return JSONObject().put("active", state.active).put("remainingMs", state.remainingMs)
+            .put("durationMinutes", state.durationMinutes).put("expired", state.expired)
+            .put("message", if (state.expired) "定时已到，朗读已停止。" else if (state.active) "暂停时仍会继续倒计时。" else "未设置定时。")
+    }
+    private fun publishSleepTimer() { listener?.onSleepTimerStatus(timerJson()) }
+    private fun scheduleSleepTimer() {
+        sleepTimerHandler.removeCallbacksAndMessages(null)
+        val state = sleepTimer.snapshot(SystemClock.elapsedRealtime())
+        if (state.active) sleepTimerHandler.postDelayed(sleepTimerTick, state.remainingMs.coerceIn(1L, 1000L))
+    }
     internal fun hasActiveQueue() = request != null
     internal fun isReadingDocument(id: String) = request != null && documentId == id
     internal fun stateSnapshot(restore: Boolean = false): JSONObject {
@@ -150,9 +222,9 @@ class OfflineSpeechService : Service() {
         state.put("bufferingMode", tts?.bufferingMode ?: "unavailable")
             .put("bufferedSlots", tts?.bufferedSlots ?: 0).put("nextAudioReady", tts?.nextAudioReady ?: false)
             .put("retainedAudioBuffers", tts?.retainedAudioBuffers ?: 0)
-        return state.put("source", "offline").put("restore", restore).put("documentId", documentId)
+        return state.put("sleepTimer", timerJson()).put("source", "offline").put("restore", restore).put("documentId", documentId)
     }
-    internal fun sendSnapshot() { listener?.onQueueStatus(stateSnapshot(true)) }
+    internal fun sendSnapshot() { checkSleepTimer(); listener?.onQueueStatus(stateSnapshot(true)); publishSleepTimer() }
     private fun publishState() { listener?.onQueueStatus(stateSnapshot()); updateMedia() }
     private fun scheduleBufferSnapshot() {
         if (bufferSnapshotPending || request == null || destroyed) return
@@ -174,7 +246,8 @@ class OfflineSpeechService : Service() {
             .put("restore", false).put("source", "offline").put("message", reason))
     }
     internal fun submitQueue(value: OfflineSpeechRequest, id: String) {
-        stopPlayback("已替换朗读队列。")
+        if (!checkSleepTimer()) return
+        stopPlayback("已替换朗读队列。", cancelTimer = false)
         request = value; documentId = id; queueIndex = 0; phase = "queued"
         message = "已接收完整离线队列，正在准备朗读。"
         try {
@@ -196,6 +269,7 @@ class OfflineSpeechService : Service() {
         notifyMediaSession()
     }
     internal fun resumePlayback() {
+        if (!checkSleepTimer()) return
         if (request == null || phase != "paused") return
         try {
             startForegroundService(Intent(this, OfflineSpeechService::class.java).setAction(ACTION_START))
@@ -204,10 +278,11 @@ class OfflineSpeechService : Service() {
         phase = "queued"; message = "从当前片段开头继续。"; publishState()
         if (!engineLoading) playCurrent()
     }
-    internal fun stopPlayback(reason: String = "朗读已停止。") {
+    internal fun stopPlayback(reason: String = "朗读已停止。", cancelTimer: Boolean = true) {
+        if (cancelTimer) cancelSleepTimer()
         val hadQueue = request != null
         invalidateSpeech()
-        if (hadQueue) endQueue("stopped", reason) else { releaseAudio(); finishForeground(); stopSelf() }
+        if (hadQueue) endQueue("stopped", reason, cancelTimer) else { releaseAudio(); finishForeground(); stopSelf() }
     }
     private fun invalidateSpeech() {
         sequence++
@@ -217,6 +292,7 @@ class OfflineSpeechService : Service() {
         tts?.stop()
     }
     private fun playCurrent() {
+        if (!checkSleepTimer()) return
         if (request == null || phase == "paused" || destroyed) return
         val entry = request?.entries?.getOrNull(queueIndex) ?: run { endQueue("done", "朗读队列已完成。"); return }
         val engine = tts
@@ -253,6 +329,7 @@ class OfflineSpeechService : Service() {
         }
     }
     private fun speechEvent(id: String?, event: String, code: Int? = null) {
+        if (!checkSleepTimer()) return
         if (id == null || id != utteranceId || request == null || phase == "paused") return
         val update = speech.event(id, event, SystemClock.elapsedRealtime(), code) ?: return
         val eventMessage = when (event) { "started" -> if (tts?.bufferingMode?.startsWith("speak-fallback:") == true) "当前引擎文件预合成不可用，已改为逐句实时朗读（不预缓冲）。" else "已启动离线音频播放；回调计时不代表实际首声。"; "done" -> "当前片段完成。"; "error" -> speechError(code); else -> "语音引擎中断，朗读已停止。" }
@@ -270,7 +347,8 @@ class OfflineSpeechService : Service() {
         }
     }
     private fun failQueue(reason: String) { invalidateSpeech(); endQueue("error", reason) }
-    private fun endQueue(endPhase: String, reason: String) {
+    private fun endQueue(endPhase: String, reason: String, cancelTimer: Boolean = true) {
+        if (cancelTimer) cancelSleepTimer()
         phase = endPhase; message = reason
         lastState = stateSnapshot().put("active", false).put("phase", endPhase)
         request = null // Do not retain document text after completion/cancel/error.
@@ -301,9 +379,12 @@ class OfflineSpeechService : Service() {
                 else PendingIntent.getService(this, code, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         }
         val current = request?.entries?.getOrNull(queueIndex)
+        val timer = sleepTimer.snapshot(SystemClock.elapsedRealtime())
+        val seconds = (timer.remainingMs + 999) / 1000
+        val timerLabel = if (timer.active) " · 定时 ${seconds / 60}:${(seconds % 60).toString().padStart(2, '0')}" else ""
         return Notification.Builder(this, CHANNEL).setSmallIcon(android.R.drawable.ic_media_play)
             .setContentTitle("InkDock 离线朗读")
-            .setContentText(if (paused) "已暂停 · 当前片段将从头继续" else "${queueIndex + 1}/${request?.entries?.size ?: 0} · 第 ${(current?.block ?: 0) + 1} 段")
+            .setContentText((if (paused) "已暂停 · 当前片段将从头继续" else "${queueIndex + 1}/${request?.entries?.size ?: 0} · 第 ${(current?.block ?: 0) + 1} 段") + timerLabel)
             .setContentIntent(open).setOnlyAlertOnce(true).setShowWhen(false)
             .setVisibility(Notification.VISIBILITY_PRIVATE).setCategory(Notification.CATEGORY_TRANSPORT)
             .setOngoing(!paused).setDeleteIntent(action(ACTION_STOP, 3))
@@ -434,8 +515,9 @@ class OfflineSpeechService : Service() {
         engineMessage = "所选离线音色设置失败或返回音色不一致，已停止朗读；请检查引擎和模型后重试。"
         return false
     }
-    private fun switchEngine(packageName: String) {
-        stopPlayback("切换语音引擎，朗读已停止。")
+    private fun switchEngine(packageName: String, preserveTimer: Boolean = false) {
+        engineReleasedForSleep = false
+        stopPlayback("切换语音引擎，朗读已停止。", cancelTimer = !preserveTimer)
         val generation = ++engineGeneration
         engineInitRequestedAt = -1L; engineInitElapsedMs = null; engineInitDiagnostic = "engine_init not_requested"
         tts?.shutdown(); tts = null; ttsReady = false; ttsInitialized = false
@@ -545,7 +627,8 @@ class OfflineSpeechService : Service() {
     }
     override fun onDestroy() {
         destroyed = true; ++engineGeneration; listener = null; invalidateSpeech(); request = null
-        main.removeCallbacksAndMessages(null); speechTimers.removeCallbacksAndMessages(null); releaseAudio(); finishForeground()
+        main.removeCallbacksAndMessages(null); speechTimers.removeCallbacksAndMessages(null)
+        sleepTimerHandler.removeCallbacksAndMessages(null); sleepTimer.cancel(); releaseAudio(); finishForeground()
         unregisterReceiver(noisy); session.release(); tts?.shutdown(); tts = null
         super.onDestroy()
     }

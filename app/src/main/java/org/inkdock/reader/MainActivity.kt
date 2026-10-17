@@ -51,18 +51,27 @@ class MainActivity : Activity() {
     private var cloudUtterance = ""
     private var cloudRequest = ""
     private var cloudCharacters = 0
-    private val cloud by lazy { CloudSpeechUi(this, { foreground && !isDestroyed },
-        { message -> sendVoiceSettings(message) }, { phase, message ->
+    private val cloud by lazy { CloudSpeechUi(this, { foreground && !isDestroyed && offline?.checkSleepTimer() == true },
+        { message -> sendVoiceSettings(message) }, cloudEvent@{ phase, message ->
+            if (phase in listOf("queued", "started", "done") && offline?.checkSleepTimer() != true) return@cloudEvent
             if (phase == "queued") emitSpeech(speech.begin(cloudUtterance, cloudRequest, cloudCharacters, SystemClock.elapsedRealtime()), message)
             else {
                 val update = speech.event(cloudUtterance, phase, SystemClock.elapsedRealtime(), if (phase == "error") -2000 else null)
                     ?: if (phase == "stopped" || phase == "error") SpeechTracker.Update(cloudUtterance, cloudRequest, phase, cloudCharacters, 0) else null
                 if (update != null) emitSpeech(update, message)
+                if (phase == "done" && cloudRequest.startsWith("preview-")) offline?.cancelSleepTimer()
             }
         }) }
     private var offline: OfflineSpeechService? = null
     private var serviceBound = false
     private val offlineListener = object : OfflineSpeechService.Listener {
+        override fun onSleepTimerStatus(state: JSONObject) {
+            if (ready && foreground && !isDestroyed) web.evaluateJavascript("window.onSleepTimerStatus && window.onSleepTimerStatus($state)", null)
+        }
+        override fun onSleepTimerExpired() {
+            stopCloudPlayback("睡眠定时已到，朗读已停止。")
+            if (ready && !isDestroyed) web.evaluateJavascript("window.stopForSleepTimer && window.stopForSleepTimer()", null)
+        }
         override fun onQueueStatus(state: JSONObject) {
             // A completed old-document snapshot must never move the new document's anchor.
             val otherDocument = state.optString("documentId").let { it.isNotEmpty() && it != documentId }
@@ -202,9 +211,9 @@ class MainActivity : Activity() {
         cloud.stop()
         speech.cancel(SystemClock.elapsedRealtime())?.let { emitSpeech(it, reason) }
     }
-    private fun stopPlayback(reason: String = "朗读已停止。") {
+    private fun stopPlayback(reason: String = "朗读已停止。", cancelTimer: Boolean = true) {
         stopCloudPlayback(reason)
-        offline?.stopPlayback(reason)
+        offline?.stopPlayback(reason, cancelTimer)
     }
     private fun blocked() = WebResourceResponse("text/plain", "UTF-8", ByteArrayInputStream(ByteArray(0)))
     private fun hash(value: String) = MessageDigest.getInstance("SHA-256").digest(value.toByteArray()).joinToString("") { "%02x".format(it) }
@@ -215,7 +224,8 @@ class MainActivity : Activity() {
         val anchor = prefs.getInt("anchor.$documentId", 0)
         val font = prefs.getInt("font", 20)
         val dark = prefs.getBoolean("dark", false)
-        web.evaluateJavascript("window.loadDocument(${JSONObject.quote(text)},$anchor,$font,$dark,${offline?.isReadingDocument(documentId) == true})", null)
+        val timer = offline?.sleepTimerSnapshot()
+        web.evaluateJavascript("window.loadDocument(${JSONObject.quote(text)},$anchor,$font,$dark,${offline?.isReadingDocument(documentId) == true || timer?.optBoolean("active") == true || timer?.optBoolean("expired") == true})", null)
     }
     private fun importText(value: String) {
         if (value.toByteArray(Charsets.UTF_8).size > MAX_BYTES) { toast("文件过大：当前预览版最多支持 8 MiB。"); return }
@@ -273,7 +283,8 @@ class MainActivity : Activity() {
         web.evaluateJavascript("window.setVoiceSettings($state)", null)
     }
     private fun speakText(value: String, requestId: String) {
-        stopPlayback()
+        if (offline?.checkSleepTimer() != true) return
+        stopPlayback(cancelTimer = false)
         val utteranceId = "paragraph-${++speechSequence}"
         val clean = value.trim()
         if (!foreground) { emitSpeech(SpeechTracker.Update(utteranceId, requestId, "stopped", clean.length, 0), "应用在后台，未开始新的朗读。"); return }
@@ -292,6 +303,18 @@ class MainActivity : Activity() {
         }
     }
     inner class Bridge {
+        @JavascriptInterface fun beginSpeaking(token: String) = runOnUiThread {
+            if (foreground && !isDestroyed && offline?.beginUserPlayback() == true)
+                web.evaluateJavascript("window.onUserPlaybackReady && window.onUserPlaybackReady(${JSONObject.quote(token.take(40))})", null)
+        }
+        @JavascriptInterface fun finishSpeaking() = runOnUiThread { offline?.cancelSleepTimer() }
+        @JavascriptInterface fun setSleepTimer(minutes: Int) = runOnUiThread {
+            if (offline?.setSleepTimer(minutes) != true) toast("请连接语音服务并输入 1–720 之间的整数分钟。")
+        }
+        @JavascriptInterface fun cancelSleepTimer() = runOnUiThread { offline?.cancelSleepTimer() }
+        @JavascriptInterface fun getSleepTimer() = runOnUiThread {
+            offline?.let { it.checkSleepTimer(); offlineListener.onSleepTimerStatus(it.sleepTimerSnapshot()) }
+        }
         @JavascriptInterface fun openKokoroSetup() = runOnUiThread {
             val service = offline ?: run { toast("正在连接语音服务，请稍后打开模型管理。"); return@runOnUiThread }
             stopPlayback(); service.releaseKokoroForMaintenance()
@@ -323,6 +346,7 @@ class MainActivity : Activity() {
             CloudVoiceProvider.values().firstOrNull { it.name == source }?.let { cloud.configure(it) }
         }
         @JavascriptInterface fun previewCloudVoice() = runOnUiThread {
+            offline?.beginUserPlayback()
             if (selectedCloud == null) sendVoiceSettings("请先选择云服务商，或使用下方系统音色试听。")
             else speakText("你好，这里是 InkDock。窗外的风轻轻吹过，我们继续读下一段故事。", "preview-${++speechSequence}")
         }
@@ -332,7 +356,7 @@ class MainActivity : Activity() {
                 sendVoiceSettings("该离线音色不可用，设置未保存。请检查系统语音包。")
             } else {
                 sendVoiceSettings("设置已保存。音色的自然度由系统语音引擎决定。")
-                if (preview) speakText("你好，这里是 InkDock。窗外的风轻轻吹过，我们继续读下一段故事。", "preview-${++speechSequence}")
+                if (preview) { offline?.beginUserPlayback(); speakText("你好，这里是 InkDock。窗外的风轻轻吹过，我们继续读下一段故事。", "preview-${++speechSequence}") }
             }
         }
         @JavascriptInterface fun speak(value: String, requestId: String) = runOnUiThread { speakText(value, requestId.take(80)) }
@@ -349,7 +373,7 @@ class MainActivity : Activity() {
                 return
             }
             runOnUiThread {
-                if (!foreground || isDestroyed || selectedCloud != null) { offline?.rejectQueue(parsed.queueId, "请在应用前台选择离线朗读后重试。"); return@runOnUiThread }
+                if (!foreground || isDestroyed || selectedCloud != null || offline?.checkSleepTimer() != true) { offline?.rejectQueue(parsed.queueId, "请在应用前台选择离线朗读后重试。"); return@runOnUiThread }
                 stopCloudPlayback()
                 val service = offline
                 if (service != null) service.submitQueue(parsed, documentId)
