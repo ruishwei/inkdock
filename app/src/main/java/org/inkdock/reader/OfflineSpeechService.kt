@@ -53,6 +53,9 @@ class OfflineSpeechService : Service() {
     private var engineGeneration = 0
     private var requestedEngine = ""
     private var engineLoading = false
+    private var engineInitRequestedAt = -1L
+    private var engineInitElapsedMs: Long? = null
+    private var engineInitDiagnostic = "engine_init not_requested"
     private data class DeclaredEngine(val name: String, val label: String)
     private var installedEngines: List<DeclaredEngine> = emptyList()
     private var engineStatus = "uninitialized"
@@ -73,6 +76,7 @@ class OfflineSpeechService : Service() {
     private var utteranceId: String? = null
     private val speech = SpeechTracker()
     private val diagnostics = ArrayDeque<String>()
+    private var bufferSnapshotPending = false
     private lateinit var session: MediaSession
     private lateinit var focusRequest: AudioFocusRequest
     private var focused = false
@@ -143,10 +147,20 @@ class OfflineSpeechService : Service() {
             .put("queueId", request!!.queueId).put("phase", phase).put("block", current?.block ?: 0)
             .put("requestId", current?.requestId.orEmpty()).put("queueIndex", queueIndex)
             .put("queueSize", request!!.entries.size).put("active", true).put("message", message)
+        state.put("bufferingMode", tts?.bufferingMode ?: "unavailable")
+            .put("bufferedSlots", tts?.bufferedSlots ?: 0).put("nextAudioReady", tts?.nextAudioReady ?: false)
         return state.put("source", "offline").put("restore", restore).put("documentId", documentId)
     }
     internal fun sendSnapshot() { listener?.onQueueStatus(stateSnapshot(true)) }
     private fun publishState() { listener?.onQueueStatus(stateSnapshot()); updateMedia() }
+    private fun scheduleBufferSnapshot() {
+        if (bufferSnapshotPending || request == null || destroyed) return
+        bufferSnapshotPending = true
+        main.post {
+            bufferSnapshotPending = false
+            if (!destroyed && request != null) publishState()
+        }
+    }
     internal fun rejectQueue(queueId: String, reason: String) {
         listener?.onQueueStatus(JSONObject().put("queueId", queueId).put("phase", "error").put("active", false)
             .put("restore", false).put("source", "offline").put("message", reason))
@@ -188,6 +202,7 @@ class OfflineSpeechService : Service() {
         if (hadQueue) endQueue("stopped", reason) else { releaseAudio(); finishForeground(); stopSelf() }
     }
     private fun invalidateSpeech() {
+        sequence++
         speechTimers.removeCallbacksAndMessages(null)
         utteranceId = null
         speech.cancel(SystemClock.elapsedRealtime())
@@ -212,15 +227,18 @@ class OfflineSpeechService : Service() {
             if (!focused) { pausePlayback("暂时无法获得音频焦点，已暂停；请稍后点继续。"); return }
         }
         wakeLock.acquire(MAX_SEGMENT_TIME_MS)
-        phase = "queued"; message = "已提交当前片段，等待离线引擎开始。"
-        val token = "offline-${++sequence}"
+        phase = "queued"; message = if (engine.bufferingMode == "file-prefetch") "正在准备离线短句音频（最多当前与下一句）。" else "已提交当前片段，等待离线引擎开始。"
+        val token = "offline-$sequence-$queueIndex"
         utteranceId = token
         emitSpeech(speech.begin(token, entry.requestId, entry.text.length, SystemClock.elapsedRealtime()), message)
         publishState()
         val result = try { engine.speak(entry.text, TextToSpeech.QUEUE_FLUSH, null, token) } catch (_: Exception) { TextToSpeech.ERROR_SERVICE }
         if (result != TextToSpeech.SUCCESS) speechEvent(token, "error", result)
         else {
-            speechTimers.postDelayed({ if (utteranceId == token) speech.queuedTimeout(token, SystemClock.elapsedRealtime())?.let {
+            request?.entries?.getOrNull(queueIndex + 1)?.let {
+                engine.prefetch(it.text, "offline-$sequence-${queueIndex + 1}")
+            }
+            speechTimers.postDelayed({ if (utteranceId == token && engine.bufferingMode == "direct") speech.queuedTimeout(token, SystemClock.elapsedRealtime())?.let {
                 utteranceId = null; engine.stop(); emitSpeech(it, speechError(it.errorCode)); failQueue(speechError(it.errorCode))
             } }, 12000)
             speechTimers.postDelayed({ if (utteranceId == token) { failQueue("当前片段超过 20 分钟仍未完成，已停止以释放后台资源。") } }, MAX_SEGMENT_TIME_MS)
@@ -229,7 +247,7 @@ class OfflineSpeechService : Service() {
     private fun speechEvent(id: String?, event: String, code: Int? = null) {
         if (id == null || id != utteranceId || request == null || phase == "paused") return
         val update = speech.event(id, event, SystemClock.elapsedRealtime(), code) ?: return
-        val eventMessage = when (event) { "started" -> "离线引擎报告开始朗读。"; "done" -> "当前片段完成。"; "error" -> speechError(code); else -> "语音引擎中断，朗读已停止。" }
+        val eventMessage = when (event) { "started" -> if (tts?.bufferingMode?.startsWith("speak-fallback:") == true) "当前引擎文件预合成不可用，已改为逐句实时朗读（不预缓冲）。" else "已启动离线音频播放；回调计时不代表实际首声。"; "done" -> "当前片段完成。"; "error" -> speechError(code); else -> "语音引擎中断，朗读已停止。" }
         emitSpeech(update, eventMessage)
         when (event) {
             "started" -> { phase = "started"; message = eventMessage; publishState() }
@@ -302,11 +320,16 @@ class OfflineSpeechService : Service() {
         if (request != null) { session.isActive = true; notifyMediaSession() }
     }
     private fun emitSpeech(update: SpeechTracker.Update, reason: String) {
-        val line = "${update.phase} chars=${update.characters} elapsed=${update.elapsedMs}ms error=${update.errorCode ?: "none"}"
-        diagnostics.addLast(line); while (diagnostics.size > 12) diagnostics.removeFirst()
+        val timingBasis = if (tts?.bufferingMode == "file-prefetch")
+            "speech_request_to_player_start_callback_not_audible_output" else "speech_request_to_engine_callback_not_audible_output"
+        val timing = if (update.phase == "started") "request_to_start_callback=${update.elapsedMs}ms (not_first_audio)"
+            else "elapsed=${update.elapsedMs}ms"
+        val line = "${update.phase} chars=${update.characters} $timing error=${update.errorCode ?: "none"}"
+        diagnostics.addLast(line); while (diagnostics.size > 80) diagnostics.removeFirst()
         Log.i("InkDockTTS", line) // No text, document title, or credential logging.
         listener?.onSpeechStatus(JSONObject().put("source", "offline").put("requestId", update.requestId).put("phase", update.phase)
             .put("characters", update.characters).put("elapsedMs", update.elapsedMs).put("message", reason)
+            .put("timingBasis", timingBasis)
             .put("errorCode", update.errorCode ?: JSONObject.NULL))
     }
     private fun offlineVoices(): List<Voice> = if (!ttsInitialized) emptyList() else tts?.voices.orEmpty().filter {
@@ -335,10 +358,14 @@ class OfflineSpeechService : Service() {
             .put("enginePackage", requestedEngine).put("requestedEngine", requestedEngine).put("engines", engines).put("source", "offline")
             .put("engineState", engineStatus).put("engineStatus", "Android 公开接口无法确认实际绑定的引擎包名；若声音不符，请停止朗读并检查系统引擎。")
             .put("engineVerified", false).put("engineBindingVerified", false)
+            .put("bufferingMode", tts?.bufferingMode ?: "unavailable").put("bufferedSlots", tts?.bufferedSlots ?: 0)
+            .put("nextAudioReady", tts?.nextAudioReady ?: false)
             .put("voiceCatalogSignature", voiceCatalogSignature).put("voiceCatalogChanged", voiceCatalogChanged)
+            .put("engineInitElapsedMs", engineInitElapsedMs ?: JSONObject.NULL)
+            .put("engineInitTimingBasis", "constructor_request_to_onInit_callback_not_audible_output")
             .put("loading", engineLoading).put("initialized", ttsInitialized).put("current", current?.name.orEmpty())
             .put("language", current?.locale?.getDisplayName(Locale.SIMPLIFIED_CHINESE).orEmpty())
-            .put("voices", voices).put("rate", voiceRate()).put("message", reason.ifBlank { engineMessage }).put("diagnostics", diagnostics.joinToString("\n"))
+            .put("voices", voices).put("rate", voiceRate()).put("message", reason.ifBlank { engineMessage }).put("diagnostics", (listOf(engineInitDiagnostic) + diagnostics).joinToString("\n"))
     }
     internal fun sendVoiceSettings(reason: String = "") { listener?.onVoiceSettings(voiceSettings(reason)) }
     internal fun selectEngine(name: String) {
@@ -347,6 +374,10 @@ class OfflineSpeechService : Service() {
         if (selected.available) switchEngine(selected.packageName)
         else {
             stopPlayback("所选引擎不可用，朗读已停止。")
+            if (engineLoading && engineInitElapsedMs == null) {
+                engineInitDiagnostic = "engine_init cancelled_before_onInit"
+                Log.i("InkDockTTS", engineInitDiagnostic)
+            }
             ++engineGeneration; tts?.shutdown(); tts = null; ttsReady = false; ttsInitialized = false; engineLoading = false
             engineStatus = "selection-rejected"; voiceCatalogSignature = ""; voiceCatalogChanged = false
             engineMessage = "未找到所选包中已启用且可访问的 TTS 服务，已拒绝切换；保留原选择。请安装或启用该引擎后重试。"
@@ -378,6 +409,7 @@ class OfflineSpeechService : Service() {
     private fun switchEngine(packageName: String) {
         stopPlayback("切换语音引擎，朗读已停止。")
         val generation = ++engineGeneration
+        engineInitRequestedAt = -1L; engineInitElapsedMs = null; engineInitDiagnostic = "engine_init not_requested"
         tts?.shutdown(); tts = null; ttsReady = false; ttsInitialized = false
         installedEngines = discoverEngines()
         val selected = OfflineEngineSelection.resolve(packageName, systemDefaultEngine(), installedEngines.map { it.name }.toSet())
@@ -396,9 +428,22 @@ class OfflineSpeechService : Service() {
         engineLoading = true; engineStatus = "initializing"
         engineMessage = "正在连接所选引擎 $requestedEngine…"; sendVoiceSettings()
         try {
+            engineInitRequestedAt = SystemClock.elapsedRealtime()
+            engineInitDiagnostic = "engine_init pending_onInit"
+            Log.i("InkDockTTS", engineInitDiagnostic)
             val init = TextToSpeech.OnInitListener { status -> finishEngineInit(generation, status) }
             // Public Android API may perform its own fallback; never label the requested package as verified binding.
-            tts = AndroidOfflineSpeechEngine(TextToSpeech(applicationContext, init, requestedEngine))
+            tts = FileBufferedOfflineSpeechEngine(applicationContext,
+                AndroidOfflineSpeechEngine(TextToSpeech(applicationContext, init, requestedEngine))) { line ->
+                diagnostics.addLast(line); while (diagnostics.size > 80) diagnostics.removeFirst()
+                Log.i("InkDockTTS", line)
+                if (line.startsWith("buffer ")) scheduleBufferSnapshot()
+                if (line.startsWith("buffer fallback")) {
+                    message = "当前引擎文件预合成不可用，已改为逐句实时朗读（不预缓冲）。"
+                    val fallbackMessage = message
+                    main.post { if (!destroyed) sendVoiceSettings(fallbackMessage) }
+                }
+            }
         } catch (_: Exception) {
             failEngineInitialization("所选引擎服务无法启动，已保留选择；请重试或手动选择其他引擎。")
             return
@@ -408,14 +453,23 @@ class OfflineSpeechService : Service() {
         } }, 12000)
     }
     private fun failEngineInitialization(reason: String) {
+        if (engineInitRequestedAt >= 0 && engineInitElapsedMs == null) {
+            val waitMs = (SystemClock.elapsedRealtime() - engineInitRequestedAt).coerceAtLeast(0)
+            engineInitDiagnostic = "engine_init ended_without_onInit wait=${waitMs}ms"
+            Log.i("InkDockTTS", engineInitDiagnostic)
+        }
         ++engineGeneration; engineLoading = false; ttsReady = false; ttsInitialized = false
         tts?.shutdown(); tts = null; engineStatus = "error"; engineMessage = reason
         sendVoiceSettings()
         if (request != null) failQueue(reason)
     }
     private fun finishEngineInit(generation: Int, status: Int) {
+        val callbackReceivedAt = SystemClock.elapsedRealtime()
         main.post {
             if (destroyed || generation != engineGeneration) return@post
+            engineInitElapsedMs = (callbackReceivedAt - engineInitRequestedAt).coerceAtLeast(0)
+            engineInitDiagnostic = "engine_init request_to_onInit=${engineInitElapsedMs}ms status=$status (not_first_audio)"
+            Log.i("InkDockTTS", engineInitDiagnostic)
             engineLoading = false; installedEngines = discoverEngines()
             if (status != TextToSpeech.SUCCESS || installedEngines.none { it.name == requestedEngine }) {
                 failEngineInitialization("所选引擎初始化失败或已不可用，已保留选择；请检查引擎后重试。")
