@@ -160,3 +160,32 @@ test('unavailable requested engine remains a selectable retry target, never empt
  assert.ok(h.nodes.engineChoice.children.some(option=>option.value==='removed.synthetic.engine'));
  h.nodes.switchEngine.onclick();assert.deepEqual(h.calls.at(-1),['engine','removed.synthetic.engine']);
 });
+
+test('timer presets/custom validate and use native authority without speech calls',()=>{
+ const h=readerHarness();h.context.Native.setSleepTimer=minutes=>h.calls.push(['timer',minutes]);
+ h.context.Native.cancelSleepTimer=()=>h.calls.push(['cancelTimer']);
+ for(const value of [15,30,60]){h.nodes['sleep'+value].onclick();assert.deepEqual(h.calls.at(-1),['timer',value]);}
+ for(const value of ['',0,-1,721,1.5,'bad']){const count=h.calls.length;h.nodes.sleepMinutes.value=value;h.nodes.startSleepTimer.onclick();assert.equal(h.calls.length,count);assert.equal(h.nodes.sleepTimerError.hidden,false);}
+ h.nodes.sleepMinutes.value='720';h.nodes.startSleepTimer.onclick();assert.deepEqual(h.calls.at(-1),['timer',720]);
+ h.context.onSleepTimerStatus({active:true,remainingMs:61001});assert.equal(h.nodes.sleepTimerStatus.textContent,'剩余 01:02');assert.equal(h.nodes.cancelSleepTimer.disabled,false);
+ h.nodes.cancelSleepTimer.onclick();assert.deepEqual(h.calls.at(-1),['cancelTimer']);
+ h.context.onSleepTimerStatus({active:false,expired:false});assert.equal(h.nodes.cancelSleepTimer.disabled,true);
+});
+test('timer entry closes other panels and native Back closes timer',()=>{
+ const h=readerHarness();h.nodes.moreButton.onclick();h.nodes.sleepTimerSettings.onclick();
+ assert.equal(h.nodes.morePanel.hidden,true);assert.equal(h.nodes.voicePanel.hidden,true);assert.equal(h.nodes.sleepTimerPanel.hidden,false);
+ assert.equal(h.context.handleNativeBack(),true);assert.equal(h.nodes.sleepTimerPanel.hidden,true);
+});
+test('native expiry invalidates delayed cloud advancement without cancelling native expired state',()=>{
+ const h=readerHarness();h.state({source:'QWEN'});h.start('测试。'.repeat(500));const first=h.calls.at(-1);
+ h.context.onSpeechStatus({requestId:first[2],phase:'done'});h.context.onSleepTimerStatus({active:false,expired:true});h.flushTimers();
+ assert.equal(h.calls.filter(call=>call[0]==='speak').length,1);assert.equal(h.read('reading'),null);assert.equal(h.read('playing'),false);
+ assert.equal(h.calls.filter(call=>call[0]==='stop').length,0);
+});
+test('explicit playback waits for native expiry processing and stale/cancelled acknowledgements cannot start it',()=>{
+ const h=readerHarness();h.state({source:'QWEN'});h.context.Native.beginSpeaking=token=>h.calls.push(['begin',token]);
+ h.start('合成测试');const token=h.calls.at(-1)[1];assert.equal(h.read('reading'),null);
+ h.context.stopForSleepTimer();h.context.onUserPlaybackReady('stale');assert.equal(h.read('reading'),null);
+ h.context.onUserPlaybackReady(token);assert.equal(h.calls.at(-1)[0],'speak');
+ h.nodes.speak.onclick();h.start('再次测试');const cancelled=h.calls.at(-1)[1];h.nodes.cloudStop.onclick();h.context.onUserPlaybackReady(cancelled);assert.equal(h.read('reading'),null);
+});
