@@ -177,6 +177,16 @@ jobs:
           "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" > build/kokoro-device/reports/apk-badging.txt
           sha256sum "$APK" app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk > build/kokoro-device/reports/SHA256SUMS.txt
           printf '%s\n' "$GITHUB_SHA" > build/kokoro-device/reports/current-source-commit.txt
+      - name: Ensure official Ubuntu emulator runtime dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Emulator links PulseAudio even with -no-audio. Use Ubuntu's package,
+          # not a copied library or a broad browser dependency installation.
+          if ! dpkg-query -W -f='${Status}' libpulse0 2>/dev/null | grep -q 'install ok installed'; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y libpulse0
+          fi
       - name: Prepare official API 35 emulator using existing accepted SDK licenses
         shell: bash
         run: |
