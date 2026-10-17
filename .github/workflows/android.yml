@@ -1,7 +1,9 @@
 name: Android debug
 on:
   push:
+    branches: [main]
   pull_request:
+    branches: [main]
   workflow_dispatch:
     inputs:
       release_version:
@@ -141,7 +143,7 @@ jobs:
           path: app/build/outputs/apk/debug/app-debug.apk
 
   release:
-    if: github.event_name == 'workflow_dispatch' && inputs.release_version != ''
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.release_version != ''
     needs: build
     runs-on: ubuntu-latest
     permissions:
