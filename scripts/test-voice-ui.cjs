@@ -9,7 +9,7 @@ const fs=require('node:fs');
   await page.addInitScript(()=>{
    window.calls=[];
    window.Native={ready(){},panelState(){},stopSpeaking(){calls.push(['stop']);},saveProgress(){},getVoiceSettings(){},
-    selectVoiceEngine(name){calls.push(['engine',name]);},setSpeechSource(source){calls.push(['source',source]);},
+    openOfflineVoiceCenter(){calls.push(['offlineCenter']);},selectVoiceEngine(name){calls.push(['engine',name]);},setSpeechSource(source){calls.push(['source',source]);},
     configureCloudVoice(source){calls.push(['config',source]);},previewCloudVoice(){calls.push(['preview']);},
     saveVoiceSettings(...args){calls.push(['voice',...args]);}};
   });
@@ -18,6 +18,9 @@ const fs=require('node:fs');
   await page.evaluate(s=>{window.loadDocument('# Test\n\nSynthetic test paragraph.',0,20,false);window.setVoiceSettings(s);document.getElementById('moreButton').click();document.getElementById('voiceSettings').click();},state);
   assert.equal(await page.locator('#offlineControls').isVisible(),true);
   assert.equal(await page.locator('#cloudControls').isVisible(),false);
+  await page.click('#offlineVoiceCenter');assert.deepEqual(await page.evaluate(()=>calls.at(-1)),['offlineCenter']);
+  assert.equal(await page.locator('#voicePanel').isVisible(),false);
+  await page.evaluate(()=>openPanel('voicePanel'));
   fs.mkdirSync('build/screenshots',{recursive:true});
   await page.screenshot({path:'build/screenshots/07-engine-selection.png'});
   await page.selectOption('#engineChoice','test.b');await page.click('#switchEngine');

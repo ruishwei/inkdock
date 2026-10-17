@@ -4,8 +4,11 @@ const {chromium}=require('playwright-core');const fs=require('node:fs');const pa
  try{
  const page=await browser.newPage({viewport:{width:390,height:844},isMobile:true,hasTouch:true});const errors=[],outbound=[];
  page.on('pageerror',e=>errors.push(e.message));page.on('request',r=>{if(/^https?:/.test(r.url()))outbound.push(r.url());});
- await page.addInitScript(()=>{window.savedVoice=null;window.requests=[];window.nativePanelOpen=false;window.Native={ready(){},panelState(open){window.nativePanelOpen=open;},saveProgress(){},speak(text,requestId){window.requests.push({text,requestId});window.onSpeechStatus({requestId,phase:'queued',message:'等待引擎'});window.onSpeechStatus({requestId,phase:'started',message:'引擎报告开始'});},getVoiceSettings(){window.setVoiceSettings({engine:'测试离线引擎',current:'zh-local',language:'中文（中国）',voices:[{name:'zh-local',language:'中文（中国）'}],rate:1});},saveVoiceSettings(name,rate,preview){window.savedVoice={name,rate,preview};},stopSpeaking(){const r=window.requests.at(-1);if(r)window.onSpeechStatus({requestId:r.requestId,phase:'stopped',message:'已停止'});}};});
+ await page.addInitScript(()=>{window.savedVoice=null;window.requests=[];window.nativePanelOpen=false;window.Native={ready(){},panelState(open){window.nativePanelOpen=open;},saveProgress(){},speak(text,requestId){window.requests.push({text,requestId});window.onSpeechStatus({requestId,phase:'queued',message:'等待引擎'});window.onSpeechStatus({requestId,phase:'started',message:'引擎报告开始'});},openDocument(){window.importPanelState=window.nativePanelOpen;},getVoiceSettings(){window.setVoiceSettings({engine:'测试离线引擎',current:'zh-local',language:'中文（中国）',voices:[{name:'zh-local',language:'中文（中国）'}],rate:1});},saveVoiceSettings(name,rate,preview){window.savedVoice={name,rate,preview};},stopSpeaking(){const r=window.requests.at(-1);if(r)window.onSpeechStatus({requestId:r.requestId,phase:'stopped',message:'已停止'});}};});
  await page.goto('file://'+path.resolve('app/src/main/assets/index.html'));fs.mkdirSync('build/screenshots',{recursive:true});
+ await page.click('#moreButton');await page.click('#open');
+ assert.equal(await page.locator('#morePanel').isVisible(),false);
+ assert.equal(await page.evaluate(()=>window.importPanelState),false);
  const sample=fs.readFileSync('app/src/main/assets/sample.md','utf8');
  await page.evaluate(text=>window.loadDocument(text),sample);await page.waitForTimeout(700);
  assert.equal(await page.locator('.katex').count(),4);assert.equal(await page.locator('.toc-title').count(),7);assert.ok(await page.locator('#content table').count());
