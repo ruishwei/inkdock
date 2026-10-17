@@ -4,7 +4,7 @@
 
 > 当前为早期预览。Android 编译结果见 [Actions](https://github.com/ruishwei/inkdock/actions)，安装包见 [Releases](https://github.com/ruishwei/inkdock/releases)。尚未经过 Vivo Y300t 真机验证。
 
-## 当前功能（alpha.5）
+## 当前功能（alpha.6）
 
 - 系统文件选择器与 Android「分享」导入 UTF-8 Markdown / 文本（上限 8 MiB）
 - KaTeX 脚本、样式和全部字体随 APK 打包；断网也能显示 `$...$`、`$$...$$`、`\(...\)` 与 `\[...\]`
@@ -15,6 +15,15 @@
 - 不再提供上下划或右滑目录操作，滑动只用于阅读。目录标题直接跳转，独立箭头展开/收起子章节；字号、主题、声音与导入移至「更多」
 - 短轻点排除选字、控件、公式/代码/表格、弹层、双击与滚动后短时间误触；保留隐藏滚动条。系统栏背景与日夜正文协调，内容继续避让系统栏
 - 朗读所选文字或从当前正文段连续往后朗读；「声音」选择已安装系统引擎、查看请求引擎与当前语言/音色，选择该引擎已安装离线中文音色、调节语速、保存并试听；无语音包时明确提示
+
+## alpha.6 后台与离线安装中心
+
+- 离线队列由 mediaPlayback 前台服务持续推进，通知/锁屏媒体控制可暂停、恢复和停止。暂停恢复从当前分片开头重读；Home/锁屏不再依赖网页回调推进。音频焦点丢失、耳机拔出会暂停。
+- 声音设置增加“离线包安装与配置”：官方来源、已安装引擎配置/模型管理、重新检测与返回选音色。此中心不在 InkDock 内下载模型，下载与配置由外部兼容系统 TTS 引擎完成。
+- 更多中的导入/字号/主题等动作先关闭面板，取消文件选择不留下更多遮罩。
+- 云朗读仍需逐片段确认，后台取消云流程，不能后台自动批准新片段。
+
+后台实现及平台依据见 [后台阅读说明](docs/background-reading.md)，外部模型管理边界见 [离线语音中心](docs/offline-voice-center.md)。真实第三方引擎与 Vivo Y300t 省电策略仍需真机确认。
 
 ## 安装和试读
 
@@ -68,13 +77,13 @@ CI 运行 Android 15 模拟器的原生 Back 回归和语音状态机测试；�
 
 ## 发布
 
-GitHub Actions 在 push/PR 时测试并构建 debug APK。维护者可在 `Android debug` 的 `Run workflow` 输入 `release_version`（如 `v0.1.0-alpha.5`）；构建成功后使用临时 GITHUB_TOKEN 发布 prerelease、APK 与 SHA256，无需持久密钥。
+GitHub Actions 在 push/PR 时测试并构建 debug APK。维护者可在 `Android debug` 的 `Run workflow` 输入 `release_version`（如 `v0.1.0-alpha.6`）；构建成功后使用临时 GITHUB_TOKEN 发布 prerelease、APK 与 SHA256，无需持久密钥。
 
 ## English
 
 An offline-first Android Markdown + LaTeX reader MVP. Native Kotlin shell, bundled KaTeX/Marked/DOMPurify, collapsible headings, bounded block rendering, local reading anchors, font/theme controls and device offline Chinese TTS. Optional native cloud TTS uses INTERNET permission, defaults to offline every launch, and requires per-segment native consent. Keys are entered only in native UI and encrypted with Android Keystore. Cloud effects/account compatibility are not live-verified. Preview builds are debug-signed and not yet device-validated. MIT; third-party notices are bundled.
 
-## 多语音验证边界（alpha.5）
+## 多语音验证边界（alpha.6）
 
 - 系统引擎切换：切换先停播，销毁旧实例，generation 隔离旧初始化/朗读回调；离线中文音色按引擎保存。
 - Qwen/MiniMax：输入模型、音色和官方 HTTPS 地址；API key 不经 JavaScript，不写日志，以 Keystore AES-GCM 加密保存到不备份目录。支持删除本机 key。
