@@ -1,4 +1,4 @@
-name: Kokoro streaming Android device experiment
+name: Kokoro streaming and sleep timer Android device experiment
 
 on:
   workflow_dispatch:
@@ -157,16 +157,66 @@ jobs:
           node-version: '22'
           cache: npm
       - name: Check current JavaScript sources
+        shell: bash
         run: |
+          set -euo pipefail
           npm ci --ignore-scripts
           npm run vendor
           git diff --exit-code -- app/src/main/assets/vendor
-          npm test
+          # Same tests/*.test.cjs suite as npm test, with the reporter before
+          # filenames so Node cannot mistake it for a test-script argument.
+          node --test --test-reporter=tap tests/*.test.cjs | tee build/kokoro-device/reports/javascript-tests.tap
+      - name: Browser regressions and sleep timer screenshots
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Same pinned Playwright package and official Chromium source as the
+          # existing browser workflow. No local browser/access workaround.
+          npx --no-install playwright-core install --with-deps chromium
+          export CHROMIUM_PATH="$(node -e 'process.stdout.write(require("playwright-core").chromium.executablePath())')"
+          test -x "$CHROMIUM_PATH"
+          node scripts/browser-smoke.cjs | tee build/kokoro-device/reports/browser-smoke.txt
+          node scripts/test-voice-ui.cjs | tee build/kokoro-device/reports/browser-voice-ui.txt
+          node scripts/test-sleep-timer-ui.cjs | tee build/kokoro-device/reports/browser-sleep-timer-ui.txt
+          node scripts/test-reading-locator.cjs | tee build/kokoro-device/reports/browser-reading-locator.txt
+          test -s build/screenshots/09-sleep-timer-mobile.png
+          test -s build/screenshots/10-sleep-timer-dark.png
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
       - name: Build current-source app and instrumentation APKs
         run: gradle --no-daemon -Pandroid.builder.sdkDownload=false :app:assembleDebug :app:assembleDebugAndroidTest :app:lintDebug :app:testDebugUnitTest
+      - name: Summarize executed JVM and JavaScript test counts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import importlib.util, json, re, xml.etree.ElementTree as ET
+          from pathlib import Path
+          reports = Path('build/kokoro-device/reports')
+          tap = (reports / 'javascript-tests.tap').read_text()
+          javascript = {key: int(re.findall(r'^# ' + key + r'\s+([0-9]+)\s*$', tap, re.M)[-1])
+                        for key in ('tests', 'pass', 'fail', 'cancelled', 'skipped', 'todo')}
+          assert javascript['tests'] > 0 and javascript['tests'] == javascript['pass']
+          assert all(javascript[key] == 0 for key in ('fail', 'cancelled', 'skipped', 'todo'))
+          junit_files = sorted(Path('app/build/test-results/testDebugUnitTest').glob('TEST-*.xml'))
+          assert junit_files, 'No executed JVM unit-test reports found'
+          jvm = {key: 0 for key in ('tests', 'failures', 'errors', 'skipped')}
+          for file in junit_files:
+              suite = ET.parse(file).getroot()
+              for key in jvm:
+                  jvm[key] += int(suite.get(key, '0'))
+          assert jvm['tests'] > 0 and all(jvm[key] == 0 for key in ('failures', 'errors', 'skipped'))
+          spec = importlib.util.spec_from_file_location('device', 'scripts/kokoro-device-models.py')
+          device = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(device)
+          summary = {'jvmUnitTests': jvm, 'javascriptNodeTests': javascript,
+                     'androidInstrumentationExpected': len(device.EXPECTED_TESTS),
+                     'androidExecutionEvidence': 'native-instrumentation.xml is produced by the later device step'}
+          (reports / 'test-counts.json').write_text(json.dumps(summary, indent=2) + '\n')
+          print(json.dumps(summary, indent=2))
+          PY
       - name: Audit current-source APK against reused JNI
         shell: bash
         run: |
@@ -203,7 +253,7 @@ jobs:
           "$ANDROID_HOME/emulator/emulator" -version > build/kokoro-device/reports/emulator-version.txt
       - name: Download and hash-check only fixed public float/int8 model files
         run: python3 scripts/kokoro-device-models.py download
-      - name: Run real JNI, bounded streaming and float callback latency on disposable API 35
+      - name: Run native streaming, callback latency and sleep timer on disposable API 35
         timeout-minutes: 40
         env:
           INKDOCK_EPHEMERAL_DEVICE_TEST: '1'
@@ -261,7 +311,7 @@ jobs:
           # Explicit new test classes only. No cloud provider/test credentials/user text.
           set +e
           timeout 1800 adb -s emulator-5554 shell am instrument -w -r \
-            -e class org.inkdock.reader.KokoroNativeDeviceTest,org.inkdock.reader.KokoroModelTransferDeviceTest,org.inkdock.reader.NativePcmPrefetchDeviceTest,org.inkdock.reader.KokoroFloatLatencyBenchmarkDeviceTest,org.inkdock.reader.KokoroStreamingDeviceTest \
+            -e class org.inkdock.reader.KokoroNativeDeviceTest,org.inkdock.reader.KokoroModelTransferDeviceTest,org.inkdock.reader.NativePcmPrefetchDeviceTest,org.inkdock.reader.KokoroFloatLatencyBenchmarkDeviceTest,org.inkdock.reader.KokoroStreamingDeviceTest,org.inkdock.reader.SleepTimerDeviceTest \
             -e kokoroVariants float,int8 \
             org.inkdock.reader.test/androidx.test.runner.AndroidJUnitRunner 2>&1 | tee "$REPORTS/instrumentation.txt"
           INSTRUMENTATION_EXIT=${PIPESTATUS[0]}
@@ -278,6 +328,7 @@ jobs:
             build/kokoro-device/reports/
             build/kokoro-device/native-test-artifacts/
             build/kokoro-device/model-inputs.json
+            build/screenshots/
             app/build/reports/lint-results-debug.*
             app/build/reports/tests/
             app/build/test-results/
@@ -286,7 +337,7 @@ jobs:
       - name: Preserve current-source experimental debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: InkDock-kokoro-streaming-device-apk-${{ github.run_id }}
+          name: InkDock-sleep-timer-device-apk-${{ github.run_id }}
           path: |
             app/build/outputs/apk/debug/app-debug.apk
             build/kokoro-device/reports/SHA256SUMS.txt
