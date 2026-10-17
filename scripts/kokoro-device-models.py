@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -32,7 +33,7 @@ REVISIONS = {
 }
 ARTIFACTS = (
     "float-speaker-3.wav", "float-speaker-53.wav", "int8-speaker-3.wav", "int8-speaker-53.wav",
-    "real-model-metrics.json", "synthetic-prefetch-metrics.json",
+    "real-model-metrics.json", "synthetic-prefetch-metrics.json", "float-latency-benchmark.json",
 )
 
 EXPECTED_TESTS = {
@@ -42,6 +43,7 @@ EXPECTED_TESTS = {
     ("org.inkdock.reader.KokoroModelTransferDeviceTest", "cancelDuringSecondFileKeepsOnlyVerifiedStagingAndRetryReusesFirstFile"),
     ("org.inkdock.reader.KokoroModelTransferDeviceTest", "wrongDigestNeverPromotesAStagingDirectory"),
     ("org.inkdock.reader.NativePcmPrefetchDeviceTest", "nextPcmBecomesReadyInBackgroundBeforeCurrentDrainAndStopReclaimsBothSlots"),
+    ("org.inkdock.reader.KokoroFloatLatencyBenchmarkDeviceTest", "fixedFloatThreadsOneTwoFourMeasureFirstWarmAndIncrementalCallbacks"),
 }
 
 
@@ -244,12 +246,45 @@ def collect(output, serial, require_all):
     (output / "artifact-index.json").write_text(json.dumps({"files": results, "missing": missing, "source": "fixed public Chinese fixture only"}, indent=2) + "\n")
     require(not require_all or not missing, "Required native test artifacts missing: " + ", ".join(missing))
     if require_all:
-        real = json.loads((output / "real-model-metrics.json").read_text())
-        synthetic = json.loads((output / "synthetic-prefetch-metrics.json").read_text())
-        require(real.get("jni", {}).get("passed") is True and real.get("adapter", {}).get("passed") is True,
-                "Real native metric report is incomplete or failed")
-        require(synthetic.get("background", {}).get("passed") is True, "Synthetic background report is incomplete or failed")
+        verify_metric_reports(output)
     print("Collected", len(results), "synthetic audio/metric artifacts; missing:", ", ".join(missing) or "none")
+
+
+def verify_metric_reports(output):
+    real = json.loads((output / "real-model-metrics.json").read_text())
+    synthetic = json.loads((output / "synthetic-prefetch-metrics.json").read_text())
+    require(real.get("jni", {}).get("passed") is True and real.get("adapter", {}).get("passed") is True,
+            "Real native metric report is incomplete or failed")
+    require(synthetic.get("background", {}).get("passed") is True, "Synthetic background report is incomplete or failed")
+    benchmark = json.loads((output / "float-latency-benchmark.json").read_text())
+    require(benchmark.get("passed") is True and benchmark.get("schemaVersion") == 1
+            and benchmark.get("variant") == "float" and benchmark.get("threadOrder") == [1, 2, 4],
+            "Float latency benchmark is incomplete or has an unexpected contract")
+    require(benchmark.get("androidApi") == 35 and type(benchmark.get("availableProcessors")) is int
+            and benchmark["availableProcessors"] > 0, "Float benchmark lacks its actual emulator CPU/API context")
+    require(benchmark.get("ownedModelsPeak") == 1 and benchmark.get("releasedModels") == 3
+            and benchmark.get("ownedModelsAtExit") == 0, "Float benchmark model cleanup is incomplete")
+    configurations = benchmark.get("configurations", [])
+    require(len(configurations) == 3, "Float benchmark must include all three thread configurations")
+    for threads, configuration in zip((1, 2, 4), configurations):
+        require(configuration.get("threads") == threads and configuration.get("passed") is True
+                and configuration.get("modelReleased") is True, "Float benchmark thread configuration failed or is incomplete")
+        runs = configuration.get("runs", [])
+        require(len(runs) == 3, "Float benchmark must include first, warm and multi-sentence runs")
+        for kind, run in zip(("first", "warm", "multi_sentence"), runs):
+            require(run.get("kind") == kind and run.get("passed") is True,
+                    "Float benchmark generation failed or is incomplete: " + kind)
+            for field in ("firstCallbackMs", "wholeGenerateMs"):
+                require(type(run.get(field)) in (int, float) and math.isfinite(run[field]) and run[field] >= 0,
+                        "Float benchmark lacks finite timing: " + field)
+            callbacks = run.get("callbacks", [])
+            require(isinstance(callbacks, list) and len(callbacks) > 0, "Float benchmark callback timeline is missing")
+            if kind == "multi_sentence":
+                comparison = run.get("callbackAndReturnComparison", {})
+                # Compatibility gate, not a latency threshold: the reviewed
+                # callback contract reconstructs returned PCM exactly.
+                require(comparison.get("comparisonPerformed") is True and comparison.get("exactMatch") is True,
+                        "Float benchmark callback/returned PCM comparison failed or was not completed")
 
 
 def instrumentation_report(log, output, exit_code):
@@ -286,7 +321,7 @@ def instrumentation_report(log, output, exit_code):
     output.parent.mkdir(parents=True, exist_ok=True)
     ET.ElementTree(suite).write(output, encoding="utf-8", xml_declaration=True)
     require(success, "Native instrumentation failed; see raw Android output and JUnit report")
-    print("All six expected native instrumentation tests passed with no skipped tests")
+    print(f"All {len(EXPECTED_TESTS)} expected native instrumentation tests passed with no skipped tests")
 
 
 def transfer_self_test(directory):
@@ -360,6 +395,73 @@ def transfer_self_test(directory):
     return checks
 
 
+def metric_self_test(directory):
+    import copy
+    output = Path(directory)
+    reports = {
+        "real-model-metrics.json": {"jni": {"passed": True}, "adapter": {"passed": True}},
+        "synthetic-prefetch-metrics.json": {"background": {"passed": True}},
+        "float-latency-benchmark.json": {
+            "schemaVersion": 1, "passed": True, "variant": "float", "threadOrder": [1, 2, 4],
+            "androidApi": 35, "availableProcessors": 2,
+            "ownedModelsPeak": 1, "releasedModels": 3, "ownedModelsAtExit": 0,
+            "configurations": [{"threads": threads, "passed": True, "modelReleased": True,
+                "runs": [{"kind": kind, "passed": True, "firstCallbackMs": 4.0, "wholeGenerateMs": 8.0,
+                          "callbacks": [{"atMs": 4.0}],
+                          "callbackAndReturnComparison": {"comparisonPerformed": True, "exactMatch": True}}
+                         for kind in ("first", "warm", "multi_sentence")]}
+                for threads in (1, 2, 4)],
+        },
+    }
+
+    def write_reports(values):
+        for name, report in values.items():
+            (output / name).write_text(json.dumps(report))
+
+    write_reports(reports)
+    verify_metric_reports(output)
+    checks = 1
+    mutations = [
+        ("real-model-metrics.json", ("jni", "passed"), False),
+        ("real-model-metrics.json", ("adapter", "passed"), False),
+        ("synthetic-prefetch-metrics.json", ("background", "passed"), False),
+        ("float-latency-benchmark.json", ("passed",), False),
+        ("float-latency-benchmark.json", ("availableProcessors",), 0),
+        ("float-latency-benchmark.json", ("threadOrder",), [1, 2]),
+        ("float-latency-benchmark.json", ("releasedModels",), 2),
+        ("float-latency-benchmark.json", ("configurations",), []),
+        ("float-latency-benchmark.json", ("configurations", 0, "modelReleased"), False),
+        ("float-latency-benchmark.json", ("configurations", 0, "runs"), []),
+        ("float-latency-benchmark.json", ("configurations", 0, "runs", 1, "passed"), False),
+        ("float-latency-benchmark.json", ("configurations", 0, "runs", 1, "wholeGenerateMs"), float("nan")),
+        ("float-latency-benchmark.json", ("configurations", 0, "runs", 1, "callbacks"), []),
+        ("float-latency-benchmark.json", ("configurations", 0, "runs", 2, "callbackAndReturnComparison", "comparisonPerformed"), False),
+        ("float-latency-benchmark.json", ("configurations", 0, "runs", 2, "callbackAndReturnComparison", "exactMatch"), False),
+    ]
+    for name, path, replacement in mutations:
+        altered = copy.deepcopy(reports)
+        target = altered[name]
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = replacement
+        write_reports(altered)
+        try:
+            verify_metric_reports(output)
+        except RuntimeError:
+            checks += 1
+        else:
+            raise AssertionError("Accepted incomplete metric report: " + str(path))
+    write_reports(reports)
+    (output / "float-latency-benchmark.json").unlink()
+    try:
+        verify_metric_reports(output)
+    except FileNotFoundError:
+        checks += 1
+    else:
+        raise AssertionError("Accepted missing float benchmark report")
+    return checks
+
+
 def self_test():
     text = MANIFEST.read_text()
     variants = parse_manifest(text)
@@ -382,6 +484,7 @@ def self_test():
             raise AssertionError("Accepted unsafe or changed model manifest")
     with tempfile.TemporaryDirectory() as directory:
         checks += transfer_self_test(directory)
+        checks += metric_self_test(directory)
         path = Path(directory) / "fixture"
         path.write_bytes(b"fixed")
         record = {"bytes": 5, "sha256": hashlib.sha256(b"fixed").hexdigest()}
@@ -392,15 +495,21 @@ def self_test():
         log, report = Path(directory) / "instrumentation.txt", Path(directory) / "report.xml"
         passing = "".join("INSTRUMENTATION_STATUS: class=" + cls + "\nINSTRUMENTATION_STATUS: test=" + method
                           + "\nINSTRUMENTATION_STATUS_CODE: 0\n" for cls, method in sorted(EXPECTED_TESTS))
-        passing += "OK (6 tests)\nINSTRUMENTATION_CODE: -1\n"
+        ok_line = f"OK ({len(EXPECTED_TESTS)} tests)"
+        passing += ok_line + "\nINSTRUMENTATION_CODE: -1\n"
+        without_benchmark = "".join("INSTRUMENTATION_STATUS: class=" + cls + "\nINSTRUMENTATION_STATUS: test=" + method
+                                    + "\nINSTRUMENTATION_STATUS_CODE: 0\n" for cls, method in sorted(EXPECTED_TESTS)
+                                    if not cls.endswith("KokoroFloatLatencyBenchmarkDeviceTest"))
+        without_benchmark += f"OK ({len(EXPECTED_TESTS) - 1} tests)\nINSTRUMENTATION_CODE: -1\n"
         log.write_text(passing)
         instrumentation_report(log, report, 0)
         checks += 1
         for altered, exit_code in ((passing.replace("CODE: 0", "CODE: -2", 1), 0),
                                    (passing.replace("CODE: 0", "CODE: -3", 1), 0),
-                                   (passing.replace("OK (6 tests)", "FAILURES!!!"), 0),
-                                   (passing.replace("OK (6 tests)", "OK (5 tests)"), 0),
+                                   (passing.replace(ok_line, "FAILURES!!!"), 0),
+                                   (passing.replace(ok_line, f"OK ({len(EXPECTED_TESTS) - 1} tests)"), 0),
                                    (passing.replace("INSTRUMENTATION_CODE: -1", ""), 0),
+                                   (without_benchmark, 0),
                                    (passing, 124)):
             log.write_text(altered)
             try:
@@ -409,7 +518,7 @@ def self_test():
                 checks += 1
             else:
                 raise AssertionError("Accepted incomplete/failed instrumentation")
-    print(f"Passed {checks} offline model/cache/transfer/instrumentation checks; no download or device used")
+    print(f"Passed {checks} offline model/cache/transfer/metrics/instrumentation checks; no download or device used")
 
 
 def main():
