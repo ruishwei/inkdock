@@ -28,6 +28,7 @@ import org.inkdock.reader.KokoroDeviceTestSupport.writeReport
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
+import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
@@ -39,6 +40,12 @@ import kotlin.math.abs
 /** Genuine fixed-hash model + x86_64 JNI. Missing staged data/runtime fails instead of skipping. */
 @RunWith(AndroidJUnit4::class)
 class KokoroNativeDeviceTest {
+    @Before fun verifyJniCallbackSignature() {
+        // Check installed DEX before loading a model or JNI's exact GetMethodID lookup.
+        assertEquals(java.lang.Integer::class.java,
+            SherpaTtsCallback::class.java.getMethod("invoke", FloatArray::class.java).returnType)
+    }
+
     @Test fun x86JniLoadsBothVariantsAndExportsChineseForSpeaker3And53() {
         assertTrue("This CI proof requires the x86_64 Android ABI", "x86_64" in Build.SUPPORTED_ABIS)
         assertTrue("JNI process must be 64 bit", Process.is64Bit())
@@ -81,10 +88,11 @@ class KokoroNativeDeviceTest {
                     for (sid in listOf(3, 53)) {
                         val callbacks = AtomicLong()
                         val callbackSamples = AtomicLong()
-                        val start = SystemClock.elapsedRealtime()
-                        val audio = model.generateWithCallback(TEXT, sid, 1f) { samples ->
+                        val callback = SherpaTtsCallback { samples ->
                             callbacks.incrementAndGet(); callbackSamples.addAndGet(samples.size.toLong()); 1
                         }
+                        val start = SystemClock.elapsedRealtime()
+                        val audio = model.generateWithCallback(TEXT, sid, 1f, callback)
                         val synthesisMs = elapsed(start)
                         assertEquals(24_000, audio.sampleRate)
                         assertTrue("Real Chinese synthesis must return bounded nonempty PCM", audio.samples.size in 1..(24_000 * 15))
