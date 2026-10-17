@@ -118,7 +118,9 @@ $('speechSource').onchange=()=>{cancelReading();bridge?.setSpeechSource($('speec
 $('cloudStop').onclick=()=>{cancelReading();readingStatus('云朗读已停止，已发送的请求可能已产生费用。');};
 $('configureCloud').onclick=()=>{cancelReading();bridge?.configureCloudVoice($('speechSource').value);};
 $('previewCloud').onclick=()=>{cancelReading();bridge?.previewCloudVoice();};
-$('switchEngine').onclick=()=>{cancelReading();bridge?.selectVoiceEngine($('engineChoice').value);};
+function selectRequestedEngine(){cancelReading();$('voiceEngine').textContent='正在请求切换：'+$('engineChoice').value;$('voiceStatus').textContent='正在初始化所选引擎，请稍候；失败会保留选择并显示原因。';bridge?.selectVoiceEngine($('engineChoice').value);}
+$('engineChoice').onchange=selectRequestedEngine;
+$('switchEngine').onclick=selectRequestedEngine;
 $('voiceRate').oninput=()=>{$('rateValue').textContent=Number($('voiceRate').value).toFixed(2)+'×';};
 function saveVoice(preview){cancelReading();bridge?.saveVoiceSettings($('voiceChoice').value,Number($('voiceRate').value),preview);}
 $('saveVoice').onclick=()=>saveVoice(false);$('previewVoice').onclick=()=>saveVoice(true);
@@ -131,9 +133,11 @@ window.setVoiceSettings=state=>{
  $('engineChoice').replaceChildren();
  const defaultEngine=document.createElement('option');defaultEngine.value='';defaultEngine.textContent='系统默认（重新检测）';$('engineChoice').append(defaultEngine);
  for(const engine of state.engines||[]){const option=document.createElement('option');option.value=engine.name;option.textContent=engine.label+' · '+engine.name;$('engineChoice').append(option);}
+ if(state.enginePackage&&!(state.engines||[]).some(engine=>engine.name===state.enginePackage)){const unavailable=document.createElement('option');unavailable.value=state.enginePackage;unavailable.textContent='不可用（保留选择） · '+state.enginePackage;$('engineChoice').append(unavailable);}
  $('engineChoice').value=state.enginePackage||'';
  $('switchEngine').disabled=!bridge;
  $('voiceEngine').textContent=(state.loading?'初始化中：':'请求使用引擎：')+(state.engine||'系统默认');
+ if(state.engineVerified===false&&state.engineStatus)$('voiceEngine').textContent+=' · '+state.engineStatus;
  $('voiceCurrent').textContent='当前语言 / 音色：'+(state.language||'未设置')+' / '+(state.current||'无可用音色');
  $('voiceChoice').replaceChildren();
  for(const voice of state.voices||[]){const option=document.createElement('option');option.value=voice.name;option.textContent=voice.language+' · '+voice.name;$('voiceChoice').append(option);}
