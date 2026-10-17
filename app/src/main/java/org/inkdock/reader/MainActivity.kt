@@ -33,8 +33,8 @@ import java.security.MessageDigest
 import java.util.Locale
 import java.util.concurrent.Executors
 
-/** Only our packaged UI can reach this bridge. No network or storage permission. */
-class MainActivity : Activity(), TextToSpeech.OnInitListener {
+/** Only packaged UI reaches this bridge. Cloud requests require native per-segment consent. */
+class MainActivity : Activity() {
     private lateinit var web: WebView
     private lateinit var root: FrameLayout
     private var appliedDark: Boolean? = null
@@ -44,7 +44,24 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     private val speechDiagnostics = ArrayDeque<String>()
     private var panelOpen = false
     private var backCallback: OnBackInvokedCallback? = null
+    private var selectedCloud: CloudVoiceProvider? = null // Every launch defaults to offline.
+    private var cloudUtterance = ""
+    private var cloudRequest = ""
+    private var cloudCharacters = 0
+    private val cloud by lazy { CloudSpeechUi(this, { foreground && !isDestroyed },
+        { message -> sendVoiceSettings(message) }, { phase, message ->
+            if (phase == "queued") emitSpeech(speech.begin(cloudUtterance, cloudRequest, cloudCharacters, SystemClock.elapsedRealtime()), message)
+            else {
+                val update = speech.event(cloudUtterance, phase, SystemClock.elapsedRealtime(), if (phase == "error") -2000 else null)
+                    ?: if (phase == "stopped" || phase == "error") SpeechTracker.Update(cloudUtterance, cloudRequest, phase, cloudCharacters, 0) else null
+                if (update != null) emitSpeech(update, message)
+            }
+        }) }
     private var tts: TextToSpeech? = null
+    private var engineGeneration = 0
+    private var requestedEngine = ""
+    private var engineLoading = false
+    private var installedEngines: List<TextToSpeech.EngineInfo> = emptyList()
     private var ttsReady = false
     private var ttsInitialized = false
     private var ready = false
@@ -90,7 +107,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         text = if (activeFile.exists()) activeFile.readText(Charsets.UTF_8) else assets.open("sample.md").bufferedReader().use { it.readText() }
         documentId = hash(text)
         web.loadUrl("file:///android_asset/index.html")
-        tts = TextToSpeech(this, this)
+        switchEngine(prefs.getString("voice.engine", "").orEmpty())
         handleIntent(intent)
     }
 
@@ -171,6 +188,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         emitSpeech(update, message)
     }
     private fun stopPlayback(reason: String = "朗读已停止。") {
+        cloud.stop()
         val update = speech.cancel(SystemClock.elapsedRealtime())
         tts?.stop()
         if (update != null) emitSpeech(update, reason)
@@ -241,20 +259,23 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     private fun sendVoiceSettings(message: String = "") {
         if (!ready || isDestroyed) return
         val engine = tts
-        val packageName = engine?.defaultEngine.orEmpty()
-        val label = engine?.engines?.firstOrNull { it.name == packageName }?.label ?: packageName
+        val packageName = requestedEngine
+        val label = installedEngines.firstOrNull { it.name == packageName }?.label ?: packageName
+        val engines = JSONArray()
+        installedEngines.forEach { engines.put(JSONObject().put("name", it.name).put("label", it.label)) }
         val voices = JSONArray()
         offlineVoices().forEach { voices.put(JSONObject().put("name", it.name).put("language", it.locale.getDisplayName(Locale.SIMPLIFIED_CHINESE))) }
         val current = if (ttsReady) engine?.voice else null
-        val state = JSONObject().put("engine", label).put("current", current?.name.orEmpty())
+        val state = JSONObject().put("engine", label).put("enginePackage", packageName).put("engines", engines)
+            .put("source", selectedCloud?.name ?: "offline").put("loading", engineLoading).put("initialized", ttsInitialized).put("current", current?.name.orEmpty())
             .put("language", current?.locale?.getDisplayName(Locale.SIMPLIFIED_CHINESE).orEmpty())
             .put("voices", voices).put("rate", voiceRate()).put("message", message).put("diagnostics", speechDiagnostics.joinToString("\n"))
         web.evaluateJavascript("window.setVoiceSettings($state)", null)
     }
-    private fun configureVoice(name: String, rate: Float): Boolean {
+    private fun configureVoice(name: String, rate: Float, stopCurrent: Boolean = true): Boolean {
         val engine = tts ?: return false
         val voice = offlineVoices().firstOrNull { it.name == name } ?: return false
-        stopPlayback()
+        if (stopCurrent) stopPlayback()
         ttsReady = false
         if (engine.setVoice(voice) != TextToSpeech.SUCCESS || engine.setSpeechRate(rate) != TextToSpeech.SUCCESS) return false
         // Do not trust a successful request if the engine silently selected a different voice.
@@ -262,7 +283,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         if (actual.name != voice.name || actual.isNetworkConnectionRequired ||
             actual.features.orEmpty().contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED)) return false
         ttsReady = true
-        prefs.edit().putString("voice.name", voice.name).putFloat("voice.rate", rate).apply()
+        prefs.edit().putString("voice.name.$requestedEngine", voice.name).putFloat("voice.rate", rate).apply()
         return true
     }
     private fun speakText(value: String, requestId: String) {
@@ -275,9 +296,14 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
             emitSpeech(update, "没有可朗读文字。请选中正文文字，或从下一段开始。")
             return
         }
-        val limit = minOf(3500, TextToSpeech.getMaxSpeechInputLength())
+        val limit = if (selectedCloud != null) CloudVoiceRequests.MAX_TEXT_UNITS else minOf(3500, TextToSpeech.getMaxSpeechInputLength())
         if (clean.length > limit) {
             emitSpeech(SpeechTracker.Update(utteranceId, requestId, "error", clean.length, 0, TextToSpeech.ERROR_INVALID_REQUEST), "朗读片段过长，请重新选择较短文字。")
+            return
+        }
+        if (selectedCloud != null) {
+            cloudUtterance = utteranceId; cloudRequest = requestId; cloudCharacters = clean.length
+            cloud.speak(selectedCloud!!, clean)
             return
         }
         val engine = tts
@@ -294,25 +320,63 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
             }
         }, 12000)
     }
-    override fun onInit(status: Int) {
+    private fun switchEngine(packageName: String) {
+        stopPlayback("切换语音引擎，朗读已停止。")
+        if (ready) web.evaluateJavascript("window.stopForEngineChange && window.stopForEngineChange()", null)
+        val generation = ++engineGeneration
+        tts?.shutdown()
+        tts = null
+        ttsReady = false
+        ttsInitialized = false
+        engineLoading = true
+        requestedEngine = packageName
+        sendVoiceSettings("正在初始化所选引擎…")
+        val listener = TextToSpeech.OnInitListener { status -> finishEngineInit(generation, status) }
+        try {
+            tts = if (packageName.isBlank()) TextToSpeech(this, listener) else TextToSpeech(this, listener, packageName)
+            installedEngines = tts?.engines.orEmpty().sortedBy { it.label.toString() }
+            if (packageName.isNotBlank() && installedEngines.none { it.name == packageName }) {
+                switchEngine("")
+                sendVoiceSettings("保存的引擎已卸载，正在请求系统默认引擎。")
+                return
+            }
+            sendVoiceSettings("正在初始化所选引擎，可选择其他引擎或重试。")
+        } catch (_: Exception) {
+            ++engineGeneration; engineLoading = false; tts?.shutdown(); tts = null
+            sendVoiceSettings("引擎服务无法启动，请选择其他已安装引擎。")
+            return
+        }
+        mainHandler.postDelayed({
+            if (generation == engineGeneration && engineLoading && !isDestroyed) {
+                ++engineGeneration
+                tts?.shutdown(); tts = null; engineLoading = false
+                sendVoiceSettings("引擎初始化超时，请重试或切换其他已安装引擎。")
+            }
+        }, 12000)
+    }
+    private fun finishEngineInit(generation: Int, status: Int) {
         mainHandler.post {
-            if (isDestroyed) return@post
+            if (isDestroyed || generation != engineGeneration) return@post
+            engineLoading = false
+            installedEngines = tts?.engines.orEmpty().sortedBy { it.label.toString() }
+            if (requestedEngine.isBlank()) requestedEngine = tts?.defaultEngine.orEmpty()
             ttsInitialized = status == TextToSpeech.SUCCESS
             if (ttsInitialized) {
                 tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                    override fun onStart(utteranceId: String?) { runOnUiThread { speechEvent(utteranceId, "started") } }
-                    override fun onDone(utteranceId: String?) { runOnUiThread { speechEvent(utteranceId, "done") } }
-                    override fun onStop(utteranceId: String?, interrupted: Boolean) { runOnUiThread { speechEvent(utteranceId, "stopped") } }
+                    override fun onStart(utteranceId: String?) { runOnUiThread { if (generation == engineGeneration) speechEvent(utteranceId, "started") } }
+                    override fun onDone(utteranceId: String?) { runOnUiThread { if (generation == engineGeneration) speechEvent(utteranceId, "done") } }
+                    override fun onStop(utteranceId: String?, interrupted: Boolean) { runOnUiThread { if (generation == engineGeneration) speechEvent(utteranceId, "stopped") } }
                     @Deprecated("Required legacy callback")
-                    override fun onError(utteranceId: String?) { runOnUiThread { speechEvent(utteranceId, "error") } }
-                    override fun onError(utteranceId: String?, errorCode: Int) { runOnUiThread { speechEvent(utteranceId, "error", errorCode) } }
+                    override fun onError(utteranceId: String?) { runOnUiThread { if (generation == engineGeneration) speechEvent(utteranceId, "error") } }
+                    override fun onError(utteranceId: String?, errorCode: Int) { runOnUiThread { if (generation == engineGeneration) speechEvent(utteranceId, "error", errorCode) } }
                 })
                 val voices = offlineVoices()
-                val saved = prefs.getString("voice.name", null)
+                prefs.edit().putString("voice.engine", requestedEngine).apply()
+                val saved = prefs.getString("voice.name.$requestedEngine", null)
                 val choice = voices.firstOrNull { it.name == saved } ?: voices.firstOrNull()
-                if (choice != null) configureVoice(choice.name, voiceRate())
+                if (choice != null) configureVoice(choice.name, voiceRate(), stopCurrent = false)
             }
-            sendVoiceSettings(if (ttsReady) "" else "未找到可用的离线中文语音，请在系统 TTS 设置检查语音包。")
+            sendVoiceSettings(if (ttsReady) "" else if (!ttsInitialized) "引擎初始化失败，请重试或选择其他已安装引擎。" else "未找到可用的离线中文语音，请在系统 TTS 设置检查语音包。")
         }
     }
     inner class Bridge {
@@ -326,7 +390,24 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
             applyReaderTheme(dark)
             prefs.edit().putInt("anchor.$documentId", anchor.coerceAtLeast(0)).putInt("font", font.coerceIn(14, 32)).putBoolean("dark", dark).apply()
         }
-        @JavascriptInterface fun getVoiceSettings() = runOnUiThread { sendVoiceSettings() }
+        @JavascriptInterface fun selectVoiceEngine(name: String) = runOnUiThread {
+            val current = tts?.engines ?: installedEngines
+            if (name.isBlank() || current.any { it.name == name }) switchEngine(name)
+            else sendVoiceSettings("未找到该引擎，请刷新列表后重试。")
+        }
+        @JavascriptInterface fun setSpeechSource(source: String) = runOnUiThread {
+            stopPlayback()
+            selectedCloud = CloudVoiceProvider.values().firstOrNull { it.name == source }
+            sendVoiceSettings(if (selectedCloud == null) "已选择系统离线朗读。" else "实验性云朗读：每段发送前需要确认，可能产生费用；真实音色尚未实测。")
+        }
+        @JavascriptInterface fun configureCloudVoice(source: String) = runOnUiThread {
+            CloudVoiceProvider.values().firstOrNull { it.name == source }?.let { cloud.configure(it) }
+        }
+        @JavascriptInterface fun previewCloudVoice() = runOnUiThread {
+            if (selectedCloud == null) sendVoiceSettings("请先选择云服务商，或使用下方系统音色试听。")
+            else speakText("你好，这里是 InkDock。窗外的风轻轻吹过，我们继续读下一段故事。", "preview-${++speechSequence}")
+        }
+        @JavascriptInterface fun getVoiceSettings() = runOnUiThread { installedEngines = tts?.engines ?: installedEngines; sendVoiceSettings() }
         @JavascriptInterface fun saveVoiceSettings(name: String, rate: Double, preview: Boolean) = runOnUiThread {
             if (!rate.isFinite() || !configureVoice(name, rate.toFloat().coerceIn(0.5f, 1.5f))) {
                 sendVoiceSettings("该离线音色不可用，设置未保存。请检查系统语音包。")
@@ -345,6 +426,6 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         stopPlayback("应用进入后台，朗读已停止。")
         if (ready && !isDestroyed) web.evaluateJavascript("window.stopForBackground && window.stopForBackground()", null)
     }
-    override fun onDestroy() { setPanelOpen(false); mainHandler.removeCallbacksAndMessages(null); web.removeJavascriptInterface("Native"); web.destroy(); tts?.shutdown(); io.shutdown(); super.onDestroy() }
+    override fun onDestroy() { ++engineGeneration; setPanelOpen(false); mainHandler.removeCallbacksAndMessages(null); cloud.close(); web.removeJavascriptInterface("Native"); web.destroy(); tts?.shutdown(); io.shutdown(); super.onDestroy() }
     companion object { private const val OPEN = 7; private const val MAX_BYTES = 8 * 1024 * 1024 }
 }
