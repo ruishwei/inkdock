@@ -17,6 +17,7 @@ import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsKokoroModelConfig
 import java.io.File
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
@@ -24,7 +25,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
-/** One leased model, one generation worker, one audio-output worker, and two reserved/retained PCM slots. */
+/** One leased model, one producer, one audio worker and two bounded streaming PCM rings. */
 internal class KokoroOfflineSpeechEngine(private val store: KokoroModelStore,
     private val variant: KokoroManifest.Variant, systemEngines: List<TextToSpeech.EngineInfo>,
     private val diagnostic: (String) -> Unit = {}, onInit: (Int) -> Unit) : OfflineSpeechEngine {
@@ -34,6 +35,7 @@ internal class KokoroOfflineSpeechEngine(private val store: KokoroModelStore,
     private val pendingGeneration = AtomicReference<Runnable?>(null)
     private val generation = AtomicLong(0)
     private val budget = PcmBudget()
+    private val streams = ConcurrentHashMap<Long, StreamingPcmSlot>()
     private val trackLock = Any()
     @Volatile private var model: OfflineTts? = null
     private var leased = false // Only the generation worker touches the lease or model lifecycle.
@@ -48,24 +50,20 @@ internal class KokoroOfflineSpeechEngine(private val store: KokoroModelStore,
     override val defaultEngine = ID
     @Volatile override var voices: Set<Voice> = emptySet(); private set
     @Volatile override var voice: Voice? = null; private set
-    override val bufferingMode get() = "native-pcm-prefetch"
+    override val bufferingMode get() = "native-pcm-stream-prefetch"
     override val bufferedSlots get() = pipeline.slotCount
     override val nextAudioReady get() = pipeline.readyAhead
     override val retainedAudioBuffers get() = budget.inUse
 
-    private val pipeline: TwoSlotSpeechPipeline<PcmBuffer> = TwoSlotSpeechPipeline(object : TwoSlotSpeechPipeline.Port<PcmBuffer> {
+    private val pipeline: StreamingSpeechPipeline<StreamingPcmSlot> = StreamingSpeechPipeline(object : StreamingSpeechPipeline.Port<StreamingPcmSlot> {
         override fun synthesize(token: Long, text: String) = generatePcm(token, text)
-        override fun play(token: Long, audio: PcmBuffer) = playPcm(token, audio)
-        override fun directSpeak(token: Long, text: String) {
-            // Native failures must not switch engines, voices, or enter an unbounded retry.
-            nativeDirectError(token)
-        }
+        override fun play(token: Long, audio: StreamingPcmSlot) = playPcm(token, audio)
         override fun cancelSynthesis() = cancelWork()
-        override fun dispose(audio: PcmBuffer) = audio.discard()
+        override fun dispose(audio: StreamingPcmSlot) = audio.discard()
         override fun event(id: String, event: String, code: Int?) = innerEvent(id, event, code)
         override fun diagnostic(value: String) = diagnostic.invoke(value)
     }, SystemClock::elapsedRealtime)
-    private val cursor = SubsentenceSpeechCursor(::split, object : SubsentenceSpeechCursor.Sink {
+    private val cursor: SubsentenceSpeechCursor = SubsentenceSpeechCursor(::split, object : SubsentenceSpeechCursor.Sink {
         override fun speakUnit(id: String, text: String) = pipeline.speak(id, text)
         override fun prefetchUnit(id: String, text: String) = pipeline.prefetch(id, text)
         override fun cancelUnits() = pipeline.cancel()
@@ -136,32 +134,60 @@ internal class KokoroOfflineSpeechEngine(private val store: KokoroModelStore,
             pendingGeneration.compareAndSet(job, null)
             if (!alive(epoch)) return@Runnable
             var reservation: PcmBudget.Reservation? = null
+            var slot: StreamingPcmSlot? = null
+            var successful = false
             try {
+                val budgetStart = SystemClock.elapsedRealtime()
                 reservation = budget.reserve { !alive(epoch) } ?: return@Runnable
                 if (!alive(epoch)) return@Runnable
                 val began = SystemClock.elapsedRealtime()
-                main.post { if (alive(epoch)) pipeline.synthesisStarted(token) }
-                val callbackSamples = AtomicLong(0)
-                val audio = requireNotNull(model).generateWithCallback(text, sid, speed, SherpaTtsCallback { samples ->
-                    val count = callbackSamples.addAndGet(samples.size.toLong())
-                    if (alive(epoch) && count <= PcmBudget.MAX_SAMPLES) 1 else 0
+                lateinit var callback: StreamingSynthesisCallback
+                lateinit var audioSlot: StreamingPcmSlot
+                val pipe = BoundedPcmStream(isCancelled = { !alive(epoch) }, onFirstPcm = {
+                    val firstPcmAt = SystemClock.elapsedRealtime()
+                    if (!main.post {
+                        if (!alive(epoch)) audioSlot.discard()
+                        else {
+                            diagnostic("pcm first token=$token firstCallbackMs=${callback.firstCallbackAt - began} firstPcmMs=${firstPcmAt - began} at=$firstPcmAt")
+                            pipeline.streamReady(token, audioSlot)
+                        }
+                    }) audioSlot.discard()
                 })
+                audioSlot = StreamingPcmSlot(pipe, reservation) { streams.remove(token) }
+                slot = audioSlot; reservation = null
+                streams[token] = audioSlot
                 if (!alive(epoch)) return@Runnable
-                check(callbackSamples.get() <= PcmBudget.MAX_SAMPLES) { "PCM callback limit" }
-                val durationMs = audio.samples.size.toLong() * 1000 / audio.sampleRate
-                val pcm = reservation.accept(audio.samples, audio.sampleRate)
-                val elapsed = SystemClock.elapsedRealtime() - began
-                if (!main.post {
-                    if (!alive(epoch)) pcm.discard()
-                    else {
-                        diagnostic("pcm generated token=$token genMs=$elapsed durationMs=$durationMs held=${budget.inUse}")
-                        pipeline.synthesisDone(token)
-                        pipeline.ready(token, pcm, durationMs)
+                main.post {
+                    if (alive(epoch)) {
+                        diagnostic("pcm producer token=$token budgetWaitMs=${began - budgetStart}")
+                        pipeline.synthesisStarted(token)
+                        main.postDelayed({ if (alive(epoch) && pipeline.isSynthesizing(token))
+                            pipeline.terminalFailure(token, "native-synthesis-timeout", TextToSpeech.ERROR_SYNTHESIS)
+                        }, SYNTHESIS_TIMEOUT_MS)
                     }
-                }) pcm.discard()
+                }
+                callback = StreamingSynthesisCallback(pipe, { alive(epoch) }, SystemClock::elapsedRealtime)
+                val audio = requireNotNull(model).generateWithCallback(text, sid, speed, SherpaTtsCallback(callback))
+                if (!alive(epoch)) return@Runnable
+                // Audited Kokoro appends every exact callback vector without postprocessing.
+                check(callback.acceptsFinal(audio.sampleRate, audio.samples.size))
+                val ended = SystemClock.elapsedRealtime()
+                val durationMs = pipe.totalWritten * 1000 / PcmBudget.SAMPLE_RATE
+                if (!main.post {
+                    if (alive(epoch)) {
+                        diagnostic("pcm generated token=$token genMs=${ended - began} durationMs=$durationMs callbacks=${callback.callbackCount} callbackSamples=${callback.samplesReceived} producerWaitMs=${pipe.writeWaitNanos / 1_000_000} queuedPeak=${pipe.maxQueuedSamples} held=${budget.inUse} at=$ended")
+                        pipeline.synthesisFinished(token)
+                    } else audioSlot.discard()
+                }) { audioSlot.discard(); return@Runnable }
+                successful = true
+                // EOF is explicit. An empty queue between callbacks is never completion.
+                pipe.finish()
             } catch (_: Throwable) {
-                main.post { if (alive(epoch)) pipeline.terminalFailure(token, "native-generation", TextToSpeech.ERROR_SYNTHESIS) }
-            } finally { reservation?.release(); if (reservation != null) reportPcmRetention() }
+                main.post { if (alive(epoch)) pipeline.terminalFailure(token, "native-stream-generation", TextToSpeech.ERROR_SYNTHESIS) }
+            } finally {
+                if (!successful) slot?.discard()
+                slot?.producerDone(); reservation?.release(); reportPcmRetention()
+            }
         }
         pendingGeneration.set(job)
         try { worker.execute(job) }
@@ -169,51 +195,67 @@ internal class KokoroOfflineSpeechEngine(private val store: KokoroModelStore,
             pendingGeneration.compareAndSet(job, null)
             pipeline.terminalFailure(token, "generation-worker-unavailable", TextToSpeech.ERROR_SERVICE)
         }
-        main.postDelayed({ if (alive(epoch) && pipeline.isSynthesizing(token))
-            pipeline.terminalFailure(token, "native-synthesis-timeout", TextToSpeech.ERROR_SYNTHESIS)
-        }, SYNTHESIS_TIMEOUT_MS)
     }
-    private fun playPcm(token: Long, pcm: PcmBuffer) {
+    private fun playPcm(token: Long, pcm: StreamingPcmSlot) {
         val epoch = generation.get()
-        if (!pcm.markPlaybackClaimed()) { pipeline.terminalFailure(token, "pcm-released", TextToSpeech.ERROR_OUTPUT); return }
+        if (!pcm.claimPlayback()) { pipeline.terminalFailure(token, "pcm-released", TextToSpeech.ERROR_OUTPUT); return }
         val playbackAttributes = attributes
         try {
             outputWorker.execute {
                 var output: AudioTrack? = null
                 var completed = false
                 var failed = false
+                var written = 0L
+                var underruns = 0
                 try {
                     if (!alive(epoch)) return@execute
-                    val samples = requireNotNull(pcm.samples)
-                    val minBuffer = AudioTrack.getMinBufferSize(pcm.sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_FLOAT)
+                    val minBuffer = AudioTrack.getMinBufferSize(PcmBudget.SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_FLOAT)
                     check(minBuffer > 0)
                     val player = AudioTrack.Builder().setAudioAttributes(playbackAttributes)
-                        .setAudioFormat(AudioFormat.Builder().setSampleRate(pcm.sampleRate)
+                        .setAudioFormat(AudioFormat.Builder().setSampleRate(PcmBudget.SAMPLE_RATE)
                             .setChannelMask(AudioFormat.CHANNEL_OUT_MONO).setEncoding(AudioFormat.ENCODING_PCM_FLOAT).build())
-                        .setBufferSizeInBytes(maxOf(minBuffer, pcm.sampleRate / 5 * 4))
+                        .setBufferSizeInBytes(maxOf(minBuffer, PcmBudget.SAMPLE_RATE / 5 * 4))
                         .setTransferMode(AudioTrack.MODE_STREAM).build()
                     output = player
                     check(player.state == AudioTrack.STATE_INITIALIZED)
                     synchronized(trackLock) { if (alive(epoch)) track = player }
                     if (!alive(epoch)) return@execute
-                    // Preload a small bounded portion, then start. Nonblocking writes keep cancellation responsive.
-                    var written = player.write(samples, 0, minOf(4096, samples.size), AudioTrack.WRITE_NON_BLOCKING)
-                    check(written >= 0)
-                    synchronized(trackLock) { if (alive(epoch)) player.play() }
-                    if (!alive(epoch)) return@execute
-                    main.post { if (alive(epoch)) pipeline.playbackStarted(token) }
+                    val samples = FloatArray(4096)
+                    var started = false
                     var progressAt = SystemClock.elapsedRealtime()
-                    while (written < samples.size && alive(epoch)) {
-                        val count = player.write(samples, written, minOf(4096, samples.size - written), AudioTrack.WRITE_NON_BLOCKING)
-                        check(count >= 0)
-                        if (count > 0) { written += count; progressAt = SystemClock.elapsedRealtime() }
-                        else { check(SystemClock.elapsedRealtime() - progressAt < 5_000); Thread.sleep(5) }
+                    var count = pcm.stream.read(samples)
+                    while (count > 0 && alive(epoch)) {
+                        var offset = 0
+                        while (offset < count && alive(epoch)) {
+                            val amount = player.write(samples, offset, count - offset, AudioTrack.WRITE_NON_BLOCKING)
+                            check(amount >= 0)
+                            if (amount > 0) {
+                                offset += amount; written += amount; progressAt = SystemClock.elapsedRealtime()
+                                if (!started) {
+                                    val firstWriteAt = progressAt
+                                    synchronized(trackLock) { if (alive(epoch)) player.play() }
+                                    val playAt = SystemClock.elapsedRealtime()
+                                    started = true
+                                    main.post { if (alive(epoch)) {
+                                        diagnostic("pcm output-start token=$token firstWriteAt=$firstWriteAt playCallAt=$playAt (not_audible_output)")
+                                        pipeline.playbackStarted(token)
+                                        reportFirstHeadProgress(token, epoch, player)
+                                    } }
+                                }
+                            } else { check(SystemClock.elapsedRealtime() - progressAt < 5_000); Thread.sleep(5) }
+                        }
+                        count = if (alive(epoch)) pcm.stream.read(samples) else -1
+                        // Time waiting for the producer must not count against the output-write watchdog.
+                        progressAt = SystemClock.elapsedRealtime()
                     }
-                    val deadline = SystemClock.elapsedRealtime() + samples.size.toLong() * 1000 / pcm.sampleRate + 10_000
+                    if (!alive(epoch)) return@execute
+                    check(count == 0 && started && written > 0)
+                    val deadline = SystemClock.elapsedRealtime() + written * 1000 / PcmBudget.SAMPLE_RATE + 10_000
                     while (alive(epoch) && (player.playbackHeadPosition.toLong() and 0xffffffffL) < written) {
                         check(SystemClock.elapsedRealtime() < deadline); Thread.sleep(10)
                     }
-                    completed = alive(epoch) && written == samples.size
+                    underruns = player.underrunCount
+                    completed = alive(epoch)
                 } catch (_: Throwable) { failed = alive(epoch) }
                 finally {
                     synchronized(trackLock) {
@@ -223,13 +265,31 @@ internal class KokoroOfflineSpeechEngine(private val store: KokoroModelStore,
                     try { output?.release() } catch (_: RuntimeException) { completed = false; failed = alive(epoch) }
                     finally { pcm.finishPlayback(); reportPcmRetention() }
                 }
-                if (completed) main.post { if (alive(epoch)) pipeline.playbackDone(token) }
-                else if (failed) main.post { if (alive(epoch)) pipeline.terminalFailure(token, "native-playback", TextToSpeech.ERROR_OUTPUT) }
+                if (completed) main.post { if (alive(epoch)) {
+                    diagnostic("pcm drained token=$token samples=$written consumerWaitMs=${pcm.stream.readWaitNanos / 1_000_000} waitCount=${pcm.stream.readWaitCount} underruns=$underruns")
+                    pipeline.playbackDone(token)
+                } }
+                else if (failed) main.post { if (alive(epoch)) pipeline.terminalFailure(token, "native-stream-playback", TextToSpeech.ERROR_OUTPUT) }
             }
         } catch (_: RuntimeException) {
             pcm.finishPlayback()
             pipeline.terminalFailure(token, "output-worker-unavailable", TextToSpeech.ERROR_SERVICE)
         }
+    }
+    private fun reportFirstHeadProgress(token: Long, epoch: Long, player: AudioTrack) {
+        val probe = object : Runnable {
+            override fun run() {
+                if (!alive(epoch)) return
+                val frames = synchronized(trackLock) {
+                    if (track !== player) return
+                    try { player.playbackHeadPosition.toLong() and 0xffffffffL }
+                    catch (_: RuntimeException) { return }
+                }
+                if (frames > 0) diagnostic("pcm head-progress token=$token frames=$frames at=${SystemClock.elapsedRealtime()} generationActive=${pipeline.isSynthesizing(token)}")
+                else main.postDelayed(this, 25)
+            }
+        }
+        main.post(probe)
     }
     private fun cancelWork() {
         synchronized(trackLock) {
@@ -237,13 +297,13 @@ internal class KokoroOfflineSpeechEngine(private val store: KokoroModelStore,
             try { track?.pause(); track?.flush() } catch (_: RuntimeException) { }
         }
         pendingGeneration.getAndSet(null)?.let { worker.remove(it) }
+        streams.values.forEach { it.discard() }
         diagnostic("pcm cancelled held=${budget.inUse}")
     }
     private fun reportPcmRetention() {
         // A canceled output/generation can release later without a playback callback.
         main.post { if (!closed) diagnostic("pcm retention held=${budget.inUse}") }
     }
-    private fun nativeDirectError(token: Long) = pipeline.directEvent(token, "error", TextToSpeech.ERROR_SYNTHESIS)
     private fun innerEvent(id: String, event: String, code: Int?) = cursor.unitEvent(id, event, code)
     override fun stop(): Int {
         cursor.cancel()?.let { listener?.onStop(it, true) }
