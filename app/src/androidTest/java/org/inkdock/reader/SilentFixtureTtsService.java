@@ -85,6 +85,17 @@ public final class SilentFixtureTtsService extends TextToSpeechService {
             return;
         }
         byte[] silence = new byte[Math.min(callback.getMaxBufferSize(), SAMPLE_RATE / 10 * 2)];
+        if (text.toString().startsWith(TEXT_PREFIX + " FAST BUFFER")) {
+            // File-prefetch regression: two seconds of synthetic PCM produced faster than playback.
+            int remaining = (int) (SAMPLE_RATE * 2 * SEGMENT_MILLIS / 1000);
+            while (remaining > 0 && generation == stopGeneration.get()) {
+                int bytes = Math.min(remaining, silence.length);
+                if (callback.audioAvailable(silence, 0, bytes) != TextToSpeech.SUCCESS) break;
+                remaining -= bytes;
+            }
+            callback.done();
+            return;
+        }
         long until = SystemClock.uptimeMillis() + SEGMENT_MILLIS;
         // Pace synthesis itself for an emulator using -no-audio. onStop interrupts it.
         while (SystemClock.uptimeMillis() < until && generation == stopGeneration.get()) {
