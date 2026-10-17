@@ -72,8 +72,12 @@ jobs:
           DEVICE_COMMIT="$(python3 -c 'import json,re; s=json.load(open("build/kokoro-arm64/input-evidence/device-run.json"))["head_sha"]; assert re.fullmatch("[0-9a-f]{40}",s); print(s)')"
           gh api "repos/ruishwei/inkdock/git/commits/$GITHUB_SHA" > "$EVIDENCE/current-commit.json"
           gh api "repos/ruishwei/inkdock/git/commits/$DEVICE_COMMIT" > "$EVIDENCE/device-commit.json"
-          gh api "repos/ruishwei/inkdock/git/trees/$GITHUB_SHA?recursive=1" > "$EVIDENCE/current-tree.json"
-          gh api "repos/ruishwei/inkdock/git/trees/$DEVICE_COMMIT?recursive=1" > "$EVIDENCE/device-tree.json"
+          # Request actual tree object IDs. Passing a commit ID may echo that ID
+          # in the trees response and fails the intentionally strict identity gate.
+          CURRENT_TREE="$(python3 -c 'import json,re,sys; s=json.load(open(sys.argv[1]))["tree"]["sha"]; assert re.fullmatch("[0-9a-f]{40}",s); print(s)' "$EVIDENCE/current-commit.json")"
+          DEVICE_TREE="$(python3 -c 'import json,re,sys; s=json.load(open(sys.argv[1]))["tree"]["sha"]; assert re.fullmatch("[0-9a-f]{40}",s); print(s)' "$EVIDENCE/device-commit.json")"
+          gh api "repos/ruishwei/inkdock/git/trees/$CURRENT_TREE?recursive=1" > "$EVIDENCE/current-tree.json"
+          gh api "repos/ruishwei/inkdock/git/trees/$DEVICE_TREE?recursive=1" > "$EVIDENCE/device-tree.json"
           gh api "repos/ruishwei/inkdock/contents/app/build.gradle.kts?ref=$GITHUB_SHA" > "$EVIDENCE/current-app-gradle.json"
           gh api "repos/ruishwei/inkdock/contents/app/build.gradle.kts?ref=$DEVICE_COMMIT" > "$EVIDENCE/device-app-gradle.json"
           python3 scripts/prepare-kokoro-arm64.py --verify-evidence "$EVIDENCE" | tee build/kokoro-arm64/reports/device-input-gate.json
