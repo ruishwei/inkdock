@@ -33,7 +33,7 @@ REVISIONS = {
 }
 ARTIFACTS = (
     "float-speaker-3.wav", "float-speaker-53.wav", "int8-speaker-3.wav", "int8-speaker-53.wav",
-    "real-model-metrics.json", "synthetic-prefetch-metrics.json", "float-latency-benchmark.json",
+    "real-model-metrics.json", "synthetic-prefetch-metrics.json", "float-latency-benchmark.json", "streaming-device-metrics.json",
 )
 
 EXPECTED_TESTS = {
@@ -44,6 +44,10 @@ EXPECTED_TESTS = {
     ("org.inkdock.reader.KokoroModelTransferDeviceTest", "wrongDigestNeverPromotesAStagingDirectory"),
     ("org.inkdock.reader.NativePcmPrefetchDeviceTest", "nextPcmBecomesReadyInBackgroundBeforeCurrentDrainAndStopReclaimsBothSlots"),
     ("org.inkdock.reader.KokoroFloatLatencyBenchmarkDeviceTest", "fixedFloatThreadsOneTwoFourMeasureFirstWarmAndIncrementalCallbacks"),
+    ("org.inkdock.reader.KokoroStreamingDeviceTest", "realFloatHeadAdvancesBeforeWholeGenerationAndQueuedNextCompletes"),
+    ("org.inkdock.reader.KokoroStreamingDeviceTest", "screenOffNotificationStopCancelsCurrentStreamAndQueuedNextWithoutRestart"),
+    ("org.inkdock.reader.KokoroStreamingDeviceTest", "syntheticProducerStarvationDoesNotBecomeEofOrPrematureDone"),
+    ("org.inkdock.reader.KokoroStreamingDeviceTest", "syntheticQueuedNextRingCanFillPromoteAndCancelWithoutLeakingSlots"),
 }
 
 
@@ -285,6 +289,43 @@ def verify_metric_reports(output):
                 # callback contract reconstructs returned PCM exactly.
                 require(comparison.get("comparisonPerformed") is True and comparison.get("exactMatch") is True,
                         "Float benchmark callback/returned PCM comparison failed or was not completed")
+    streaming = json.loads((output / "streaming-device-metrics.json").read_text())
+    verify_streaming_report(streaming)
+
+
+def verify_streaming_report(streaming):
+    require(streaming.get("schemaVersion") == 1, "Unexpected streaming metric schema")
+    for section in ("real_overlap", "real_stop", "synthetic_starvation", "synthetic_next"):
+        require(streaming.get(section, {}).get("passed") is True, "Streaming metrics failed or incomplete: " + section)
+    for section in ("real_overlap", "real_stop"):
+        row = streaming[section]
+        require(row.get("realFloatModel") is True and row.get("modelLeaseReleased") is True
+                and row.get("settledBeforeEngineDetach", {}).get("retainedAudioBuffers") == 0,
+                "Real streaming model/PCM cleanup failed or incomplete: " + section)
+    overlap = streaming["real_overlap"]
+    observations = overlap.get("observations", [])
+    require(overlap.get("queuedNextCompleted") is True and len(observations) == 2,
+            "Both real streamed entries must finish, including queued next")
+    first = observations[0]
+    require(first.get("headBeforeGenerationReturn") is True and type(first.get("headLeadMs")) in (int, float)
+            and math.isfinite(first["headLeadMs"]) and first["headLeadMs"] > 0,
+            "Real AudioTrack head did not advance before whole generation returned")
+    # The second stream may already be fully prefetched when it starts playing.
+    # Do not demand a positive generation overlap for that queued-next entry.
+    for observation in observations:
+        require(type(observation.get("queuedPeakSamples")) is int and 1 <= observation["queuedPeakSamples"] <= 192_000,
+                "Real stream exceeded the default 8-second PCM ring")
+    stopped = streaming["real_stop"].get("settledState", {})
+    require(stopped.get("phase") == "stopped" and stopped.get("bufferedSlots") == 0
+            and stopped.get("retainedAudioBuffers") == 0, "Streaming notification Stop did not settle both slots")
+    starvation = streaming["synthetic_starvation"]
+    require(starvation.get("syntheticProducer") is True and starvation.get("realAudioTrack") is True
+            and starvation.get("exactRingInputMatch") is True, "Synthetic starvation/PCM identity proof is incomplete")
+    queued = streaming["synthetic_next"]
+    require(queued.get("syntheticProducer") is True and queued.get("realAudioTrack") is True
+            and queued.get("promotionExactRingInputMatch") is True and queued.get("promotionMaxSlots") == 2
+            and queued.get("cancelMaxSlots") == 2 and queued.get("slotsAfterCancel") == 0,
+            "Synthetic queued-next promotion/cancellation proof is incomplete")
 
 
 def instrumentation_report(log, output, exit_code):
@@ -412,6 +453,20 @@ def metric_self_test(directory):
                          for kind in ("first", "warm", "multi_sentence")]}
                 for threads in (1, 2, 4)],
         },
+        "streaming-device-metrics.json": {
+            "schemaVersion": 1,
+            "real_overlap": {"passed": True, "realFloatModel": True, "modelLeaseReleased": True,
+                "settledBeforeEngineDetach": {"retainedAudioBuffers": 0}, "queuedNextCompleted": True,
+                "observations": [{"headBeforeGenerationReturn": True, "headLeadMs": 8, "queuedPeakSamples": 192_000},
+                                 {"headBeforeGenerationReturn": False, "headLeadMs": -8, "queuedPeakSamples": 192_000}]},
+            "real_stop": {"passed": True, "realFloatModel": True, "modelLeaseReleased": True,
+                "settledBeforeEngineDetach": {"retainedAudioBuffers": 0},
+                "settledState": {"phase": "stopped", "bufferedSlots": 0, "retainedAudioBuffers": 0}},
+            "synthetic_starvation": {"passed": True, "syntheticProducer": True, "realAudioTrack": True,
+                "exactRingInputMatch": True},
+            "synthetic_next": {"passed": True, "syntheticProducer": True, "realAudioTrack": True,
+                "promotionExactRingInputMatch": True, "promotionMaxSlots": 2, "cancelMaxSlots": 2, "slotsAfterCancel": 0},
+        },
     }
 
     def write_reports(values):
@@ -437,6 +492,22 @@ def metric_self_test(directory):
         ("float-latency-benchmark.json", ("configurations", 0, "runs", 1, "callbacks"), []),
         ("float-latency-benchmark.json", ("configurations", 0, "runs", 2, "callbackAndReturnComparison", "comparisonPerformed"), False),
         ("float-latency-benchmark.json", ("configurations", 0, "runs", 2, "callbackAndReturnComparison", "exactMatch"), False),
+        ("streaming-device-metrics.json", ("real_overlap", "passed"), False),
+        ("streaming-device-metrics.json", ("real_stop", "passed"), False),
+        ("streaming-device-metrics.json", ("synthetic_starvation", "passed"), False),
+        ("streaming-device-metrics.json", ("synthetic_next", "passed"), False),
+        ("streaming-device-metrics.json", ("real_overlap", "queuedNextCompleted"), False),
+        ("streaming-device-metrics.json", ("real_overlap", "observations"), []),
+        ("streaming-device-metrics.json", ("real_overlap", "observations", 0, "headLeadMs"), 0),
+        ("streaming-device-metrics.json", ("real_overlap", "observations", 0, "queuedPeakSamples"), 192_001),
+        ("streaming-device-metrics.json", ("real_overlap", "modelLeaseReleased"), False),
+        ("streaming-device-metrics.json", ("real_stop", "settledBeforeEngineDetach", "retainedAudioBuffers"), 1),
+        ("streaming-device-metrics.json", ("real_stop", "settledState", "phase"), "started"),
+        ("streaming-device-metrics.json", ("real_stop", "settledState", "bufferedSlots"), 1),
+        ("streaming-device-metrics.json", ("synthetic_starvation", "exactRingInputMatch"), False),
+        ("streaming-device-metrics.json", ("synthetic_next", "promotionExactRingInputMatch"), False),
+        ("streaming-device-metrics.json", ("synthetic_next", "cancelMaxSlots"), 1),
+        ("streaming-device-metrics.json", ("synthetic_next", "slotsAfterCancel"), 1),
     ]
     for name, path, replacement in mutations:
         altered = copy.deepcopy(reports)
@@ -451,14 +522,15 @@ def metric_self_test(directory):
             checks += 1
         else:
             raise AssertionError("Accepted incomplete metric report: " + str(path))
-    write_reports(reports)
-    (output / "float-latency-benchmark.json").unlink()
-    try:
-        verify_metric_reports(output)
-    except FileNotFoundError:
-        checks += 1
-    else:
-        raise AssertionError("Accepted missing float benchmark report")
+    for name in ("float-latency-benchmark.json", "streaming-device-metrics.json"):
+        write_reports(reports)
+        (output / name).unlink()
+        try:
+            verify_metric_reports(output)
+        except FileNotFoundError:
+            checks += 1
+        else:
+            raise AssertionError("Accepted missing mandatory report: " + name)
     return checks
 
 
@@ -501,6 +573,10 @@ def self_test():
                                     + "\nINSTRUMENTATION_STATUS_CODE: 0\n" for cls, method in sorted(EXPECTED_TESTS)
                                     if not cls.endswith("KokoroFloatLatencyBenchmarkDeviceTest"))
         without_benchmark += f"OK ({len(EXPECTED_TESTS) - 1} tests)\nINSTRUMENTATION_CODE: -1\n"
+        prior_tests = [(cls, method) for cls, method in sorted(EXPECTED_TESTS) if not cls.endswith("KokoroStreamingDeviceTest")]
+        without_streaming = "".join("INSTRUMENTATION_STATUS: class=" + cls + "\nINSTRUMENTATION_STATUS: test=" + method
+                                    + "\nINSTRUMENTATION_STATUS_CODE: 0\n" for cls, method in prior_tests)
+        without_streaming += f"OK ({len(prior_tests)} tests)\nINSTRUMENTATION_CODE: -1\n"
         log.write_text(passing)
         instrumentation_report(log, report, 0)
         checks += 1
@@ -510,6 +586,7 @@ def self_test():
                                    (passing.replace(ok_line, f"OK ({len(EXPECTED_TESTS) - 1} tests)"), 0),
                                    (passing.replace("INSTRUMENTATION_CODE: -1", ""), 0),
                                    (without_benchmark, 0),
+                                   (without_streaming, 0),
                                    (passing, 124)):
             log.write_text(altered)
             try:
