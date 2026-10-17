@@ -6,14 +6,16 @@ for(const display of [true,false]) marked.use({extensions:[{name:display?'displa
 // Escape raw HTML before it reaches the sanitizer, while allowing trusted KaTeX styles.
 marked.use({renderer:{html(token){return token.text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}}});
 function safeHtml(block){const tokens=[block.token];tokens.links=book.links;return DOMPurify.sanitize(marked.parser(tokens),{USE_PROFILES:{html:true,mathMl:true,svg:true},FORBID_TAGS:['img','iframe','form','input'],FORBID_ATTR:['id','name','href','src','xlink:href']});}
-function render(target=0){
+function render(target=0,locate=false){
   if(!book.blocks.length){current=0;page=0;$('content').textContent='文档为空，请导入 UTF-8 Markdown 文件。';$('prev').disabled=true;$('next').disabled=true;$('status').textContent='0 段';return;}
   current=Math.max(0,Math.min(target,book.blocks.length-1));page=Math.floor(current/40);
   const range=book.chunks[page];$('content').replaceChildren();
   for(let i=range.start;i<range.end;i++){const section=document.createElement('section');section.id=book.blocks[i].id;section.dataset.index=i;section.innerHTML=safeHtml(book.blocks[i]);$('content').append(section);}
   $('prev').disabled=page===0;$('next').disabled=page===book.chunks.length-1;
   $('status').textContent=`${page+1} / ${book.chunks.length} 组 · ${book.blocks.length} 段`;
-  requestAnimationFrame(()=>{document.getElementById(`p-${current}`)?.scrollIntoView();persist();});
+  refreshReadingHighlight();
+  const renderedTarget=current,renderedBook=book;
+  requestAnimationFrame(()=>{if(book!==renderedBook||page!==Math.floor(renderedTarget/40))return;document.getElementById(book.blocks[renderedTarget]?.id)?.scrollIntoView(locate?{block:'center'}:undefined);persist();});
 }
 function buildToc(){
  $('toc').replaceChildren();const roots=[],stack=[];
@@ -30,19 +32,36 @@ function buildToc(){
  append(roots,$('toc'));if(!book.headings.length)$('toc').textContent='此文档没有标题。';
 }
 function persist(){if(bridge)bridge.saveProgress(current,size,document.body.classList.contains('dark'));}
-window.loadDocument=(text,anchor=0,font=20,dark=false,preserveNative=false)=>{if(!preserveNative)cancelReading();readingStatus('');book=InkEngine.indexDocument(text);size=Math.max(14,Math.min(32,font));$('content').style.fontSize=`${size}px`;document.body.classList.toggle('dark',dark);$('theme').textContent=dark?'日间模式':'夜间模式';buildToc();render(anchor);};
+window.loadDocument=(text,anchor=0,font=20,dark=false,preserveNative=false)=>{if(!preserveNative)cancelReading();clearReadingLocation();readingStatus('');book=InkEngine.indexDocument(text);size=Math.max(14,Math.min(32,font));$('content').style.fontSize=`${size}px`;document.body.classList.toggle('dark',dark);$('theme').textContent=dark?'日间模式':'夜间模式';buildToc();render(anchor);};
 $('open').onclick=()=>{cancelReading();closePanels();bridge?.openDocument();};$('tocButton').onclick=()=>openPanel('tocPanel');
 $('prev').onclick=()=>render(Math.max(0,(page-1)*40));$('next').onclick=()=>render(Math.min(book.blocks.length-1,(page+1)*40));
 $('smaller').onclick=()=>{closePanels();size=Math.max(14,size-2);$('content').style.fontSize=`${size}px`;persist();};
 $('larger').onclick=()=>{closePanels();size=Math.min(32,size+2);$('content').style.fontSize=`${size}px`;persist();};
 $('theme').onclick=()=>{closePanels();document.body.classList.toggle('dark');$('theme').textContent=document.body.classList.contains('dark')?'日间模式':'夜间模式';persist();};
-let speakSelection='',playing=false,reading=null,requestCounter=0,offlineQueueId=null;
+let speakSelection='',playing=false,reading=null,requestCounter=0,offlineQueueId=null,spokenBlock=null,pendingUserPlayback=null,userPlaybackSequence=0;
 function updatePlayButton(active){playing=!!active;$('playIcon').toggleAttribute('hidden',playing);$('stopIcon').toggleAttribute('hidden',!playing);$('speak').setAttribute('aria-label',playing?'停止朗读':'从当前段连续朗读或朗读所选文字');$('speak').title=playing?'停止朗读':'连续朗读';}
 function readingStatus(message){$('playbackStatus').textContent=message;$('playbackStatus').hidden=!message;}
 function clearHighlight(){document.querySelectorAll('.speaking').forEach(el=>el.classList.remove('speaking'));}
-function cancelReading(){$('voicePauseResume').disabled=true;offlineQueueId=null;reading=null;clearHighlight();updatePlayButton(false);bridge?.stopSpeaking();}
+// Track the audible paragraph independently of the paragraph currently being browsed.
+// Queue/prefetch notifications never advance this anchor, and playback never scrolls.
+function refreshReadingHighlight(){
+ clearHighlight();
+ if(spokenBlock!==null)document.getElementById(book.blocks[spokenBlock]?.id)?.classList.add('speaking');
+ $('locateReading').disabled=spokenBlock===null;
+}
+function clearReadingLocation(){spokenBlock=null;refreshReadingHighlight();}
+function setReadingLocation(index){
+ spokenBlock=Number.isInteger(index)&&index>=0&&index<book.blocks.length?index:null;
+ refreshReadingHighlight();
+}
+$('locateReading').onclick=()=>{
+ if(spokenBlock===null)return;
+ closePanels();render(spokenBlock,true);
+};
+function cancelReading(){pendingUserPlayback=null;$('voicePauseResume').disabled=true;offlineQueueId=null;reading=null;clearReadingLocation();updatePlayButton(false);bridge?.stopSpeaking();}
+window.stopForSleepTimer=()=>{reading=null;offlineQueueId=null;clearReadingLocation();updatePlayButton(false);$('voicePauseResume').disabled=true;readingStatus('睡眠定时已到，朗读已停止。');};
 window.stopForEngineChange=()=>{cancelReading();readingStatus('切换语音引擎，朗读已停止。');};
-window.stopForBackground=()=>{if($('speechSource').value==='offline')return;reading=null;clearHighlight();updatePlayButton(false);readingStatus('云朗读在后台暂停；返回后重新点击朗读并确认片段。');};
+window.stopForBackground=()=>{if($('speechSource').value==='offline')return;reading=null;clearReadingLocation();updatePlayButton(false);readingStatus('云朗读在后台暂停；返回后重新点击朗读并确认片段。');};
 function speechParts(text){return $('speechSource').value==='offline'?InkSpeech.splitOfflineText(text).filter(part=>part.trim()):InkSpeech.splitText(text,600);}
 function blockSpeech(index){const block=book.blocks[index];if(!block||['heading','code','hr','displayMath'].includes(block.token.type))return '';
  const holder=document.createElement('div');holder.innerHTML=safeHtml(block);holder.querySelectorAll('.katex').forEach(el=>el.replaceWith(document.createTextNode('（公式）')));
@@ -51,12 +70,11 @@ function blockSpeech(index){const block=book.blocks[index];if(!block||['heading'
 function sendReadingPart(){
  const job=reading;if(!job)return;
  if(job.mode==='continuous'){
-  while(job.part>=job.parts.length){if(job.nextBlock>=book.blocks.length){reading=null;clearHighlight();updatePlayButton(false);readingStatus(job.sent?'全文朗读完成。':'没有可朗读的正文段落；标题、纯公式和代码块会跳过。');return;}
+  while(job.part>=job.parts.length){if(job.nextBlock>=book.blocks.length){reading=null;clearReadingLocation();updatePlayButton(false);bridge?.finishSpeaking?.();readingStatus(job.sent?'全文朗读完成。':'没有可朗读的正文段落；标题、纯公式和代码块会跳过。');return;}
    job.block=job.nextBlock++;job.parts=speechParts(blockSpeech(job.block));job.part=0;
   }
-  if(Math.floor(job.block/40)!==page)render(job.block);
-  current=job.block;clearHighlight();const element=document.getElementById(`p-${job.block}`);element?.classList.add('speaking');element?.scrollIntoView({block:'nearest'});persist();
- }else if(job.part>=job.parts.length){reading=null;updatePlayButton(false);readingStatus('选中文字朗读完成。');return;}
+  // The started callback selects the paragraph only once playback actually begins.
+ }else if(job.part>=job.parts.length){reading=null;updatePlayButton(false);bridge?.finishSpeaking?.();readingStatus('选中文字朗读完成。');return;}
  job.sent=(job.sent||0)+1;job.requestId='reader-'+(++requestCounter);readingStatus('正在提交语音片段…');updatePlayButton(true);
  if(bridge)bridge.speak(job.parts[job.part],job.requestId);else{reading=null;updatePlayButton(false);readingStatus('浏览器预览没有 Android 语音引擎。');}
 }
@@ -64,10 +82,15 @@ $('speak').addEventListener('pointerdown',()=>{speakSelection=window.getSelectio
 $('speak').onclick=()=>{
  const captured=speakSelection;speakSelection='';
  if(playing){cancelReading();readingStatus('朗读已停止。');return;}
+ clearReadingLocation();
  const selected=(captured||window.getSelection()?.toString()||'').trim();
- if($('speechSource').value==='offline'&&bridge?.speakOfflineQueue){startOfflineQueue(selected);return;}
- reading=selected?{mode:'selection',parts:speechParts(selected),part:0}:{mode:'continuous',nextBlock:current,block:current,parts:[],part:0};sendReadingPart();
+ const start=()=>{
+  if($('speechSource').value==='offline'&&bridge?.speakOfflineQueue){startOfflineQueue(selected);return;}
+  reading=selected?{mode:'selection',parts:speechParts(selected),part:0}:{mode:'continuous',nextBlock:current,block:current,parts:[],part:0};sendReadingPart();
+ };
+ if(bridge?.beginSpeaking){const token=String(++userPlaybackSequence);pendingUserPlayback={token,start};bridge.beginSpeaking(token);}else start();
 };
+window.onUserPlaybackReady=token=>{const pending=pendingUserPlayback;if(!pending||pending.token!==token)return;pendingUserPlayback=null;pending.start();};
 function startOfflineQueue(selected){
  const entries=[];
  if(selected){for(const text of InkSpeech.splitOfflineText(selected))if(text.trim())entries.push({text,block:-1});}
@@ -77,7 +100,7 @@ function startOfflineQueue(selected){
  const queueId='offline-'+Date.now()+'-'+(++requestCounter);
  const payload=JSON.stringify({queueId,entries});
  if(payload.length>12*1024*1024){readingStatus('朗读队列过大，请选取较短文字或拆分文档。没有提交部分队列。');return;}
- reading=null;offlineQueueId=queueId;updatePlayButton(true);readingStatus('正在准备后台离线朗读…');
+ clearReadingLocation();reading=null;offlineQueueId=queueId;updatePlayButton(true);readingStatus('正在准备后台离线朗读…');
  bridge.speakOfflineQueue(payload);
 }
 window.onOfflineQueueStatus=event=>{
@@ -85,31 +108,31 @@ window.onOfflineQueueStatus=event=>{
  if(offlineQueueId&&event.queueId!==offlineQueueId&&!event.restore)return;
  if(!offlineQueueId&&!event.restore)return;
  offlineQueueId=event.queueId||null;readingStatus(event.message||event.phase);
- const active=['queued','started','paused'].includes(event.phase);updatePlayButton(active);
+ const active=event.active!==false&&['queued','started','paused'].includes(event.phase);updatePlayButton(active);
  $('voicePauseResume').disabled=!active;$('voicePauseResume').dataset.paused=String(event.phase==='paused');
  $('voicePauseResume').textContent=event.phase==='paused'?'从当前片段开头恢复':'暂停（按片段恢复）';
- if(active&&Number.isInteger(event.block)&&event.block>=0&&event.block<book.blocks.length){
-  if(Math.floor(event.block/40)!==page)render(event.block);
-  current=event.block;clearHighlight();document.getElementById(`p-${current}`)?.classList.add('speaking');persist();
- }
- if(!active){offlineQueueId=null;clearHighlight();}
+ if(active&&(event.phase==='started'||event.phase==='paused'))setReadingLocation(event.block);
+ if(!active){offlineQueueId=null;clearReadingLocation();}
 };
 window.onSpeechStatus=event=>{
  if(event.source==='offline'&&offlineQueueId)return;
  const job=reading;if(job&&event.requestId!==job.requestId)return;
  if(!job&&event.requestId?.startsWith('reader-'))return;
  readingStatus(event.message||event.phase);
- if(event.phase==='queued'||event.phase==='started')updatePlayButton(true);
+ if(event.phase==='queued'||event.phase==='started'){
+  updatePlayButton(true);
+  if(event.phase==='started'&&job)setReadingLocation(job.mode==='continuous'?job.block:null);
+ }
  else if(event.phase==='done'&&job){job.part++;setTimeout(()=>{if(reading===job)sendReadingPart();},120);}
- else{if(event.phase==='error'||event.phase==='stopped')reading=null;clearHighlight();updatePlayButton(false);}
+ else{if(event.phase==='error'||event.phase==='stopped')reading=null;clearReadingLocation();updatePlayButton(false);}
 };
 window.addEventListener('scroll',()=>{clearTimeout(saveTimer);saveTimer=setTimeout(()=>{const sections=[...$('content').children];const visible=sections.find(el=>el.getBoundingClientRect().bottom>16);if(visible){current=Number(visible.dataset.index);persist();}},200);});
 function showToolbar(visible){
  $('toolbar').classList.toggle('is-hidden',!visible);$('toolbar').inert=!visible;
  $('toolbar').setAttribute('aria-hidden',String(!visible));
 }
-function closePanels(){for(const id of ['tocPanel','voicePanel','morePanel'])$(id).hidden=true;bridge?.panelState(false);}
-window.handleNativeBack=()=>{const open=['tocPanel','voicePanel','morePanel'].some(id=>!$(id).hidden);if(open){closePanels();showToolbar(true);}return open;};
+function closePanels(){for(const id of ['tocPanel','voicePanel','morePanel','sleepTimerPanel'])$(id).hidden=true;bridge?.panelState(false);}
+window.handleNativeBack=()=>{const open=['tocPanel','voicePanel','morePanel','sleepTimerPanel'].some(id=>!$(id).hidden);if(open){closePanels();showToolbar(true);}return open;};
 function openPanel(id){cancelTap();closePanels();showToolbar(true);$(id).hidden=false;bridge?.panelState(true);}
 $('moreButton').onclick=()=>openPanel('morePanel');$('closeMore').onclick=closePanels;
 $('closeToc').onclick=closePanels;$('closeVoice').onclick=closePanels;
@@ -163,12 +186,34 @@ $('content').addEventListener('touchstart',event=>{if(event.touches.length>1)can
 $('content').addEventListener('pointerup',event=>{
  const start=tap;tap=null;if(!start||start.id!==event.pointerId)return;
  const now=performance.now();lastTap=now;
- const accepted=InkGestures.isTap({distance:Math.max(start.distance,Math.hypot(event.clientX-start.x,event.clientY-start.y)),duration:now-start.at,sinceScroll:now-lastScroll,blocked:start.blocked||['tocPanel','voicePanel','morePanel'].some(id=>!$(id).hidden),selected:start.selected||hasSelection()});
+ const accepted=InkGestures.isTap({distance:Math.max(start.distance,Math.hypot(event.clientX-start.x,event.clientY-start.y)),duration:now-start.at,sinceScroll:now-lastScroll,blocked:start.blocked||['tocPanel','voicePanel','morePanel','sleepTimerPanel'].some(id=>!$(id).hidden),selected:start.selected||hasSelection()});
  if(accepted)tapTimer=setTimeout(()=>{if(!hasSelection()&&performance.now()-lastScroll>=450)showToolbar($('toolbar').classList.contains('is-hidden'));},320);
 });
 $('content').addEventListener('keydown',event=>{if(event.key==='Enter'&&event.target===$('content')&&!hasSelection()){event.preventDefault();showToolbar($('toolbar').classList.contains('is-hidden'));}});
 function measureTools(){document.documentElement.style.setProperty('--tools-height',$('toolbar').offsetHeight+'px');}
 new ResizeObserver(measureTools).observe($('toolbar'));measureTools();
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){closePanels();showToolbar(true);}});
+// The native elapsed-realtime deadline owns playback. This interval only asks for display snapshots.
+window.onSleepTimerStatus=state=>{
+ const active=!!state.active;
+ const seconds=Math.max(0,Math.ceil(Number(state.remainingMs||0)/1000));
+ const remaining=String(Math.floor(seconds/60)).padStart(2,'0')+':'+String(seconds%60).padStart(2,'0');
+ $('sleepTimerStatus').textContent=active?'剩余 '+remaining:state.expired?'定时已到，朗读已停止。':'未开启定时';
+ $('sleepTimerSettings').textContent=active?'睡眠定时 · '+remaining:'睡眠定时 · '+(state.expired?'已结束':'未开启');
+ $('cancelSleepTimer').disabled=!active;
+ if(state.expired)window.stopForSleepTimer();
+};
+function setSleepMinutes(minutes){
+ const valid=Number.isInteger(minutes)&&minutes>=1&&minutes<=720;
+ $('sleepTimerError').hidden=valid&&!!bridge?.setSleepTimer;
+ $('sleepTimerError').textContent=!valid?'请输入 1–720 之间的整数分钟。':'浏览器预览不能启动原生睡眠定时。';
+ if(valid&&bridge?.setSleepTimer)bridge.setSleepTimer(minutes);
+}
+$('sleepTimerSettings').onclick=()=>{openPanel('sleepTimerPanel');bridge?.getSleepTimer?.();$('closeSleepTimer').focus?.();};
+$('closeSleepTimer').onclick=()=>{closePanels();$('moreButton').focus?.();};
+for(const minutes of [15,30,60])$('sleep'+minutes).onclick=()=>setSleepMinutes(minutes);
+$('startSleepTimer').onclick=()=>setSleepMinutes(Number($('sleepMinutes').value));
+$('cancelSleepTimer').onclick=()=>bridge?.cancelSleepTimer?.();
+if(typeof setInterval==='function')setInterval(()=>{if(!document.hidden)bridge?.getSleepTimer?.();},1000);
 if(bridge)bridge.ready();
 else window.setVoiceSettings({engine:'浏览器预览（无 Android TTS）',voices:[],rate:1});
