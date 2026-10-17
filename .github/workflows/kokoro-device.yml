@@ -180,8 +180,10 @@ jobs:
           node scripts/test-voice-ui.cjs | tee build/kokoro-device/reports/browser-voice-ui.txt
           node scripts/test-sleep-timer-ui.cjs | tee build/kokoro-device/reports/browser-sleep-timer-ui.txt
           node scripts/test-reading-locator.cjs | tee build/kokoro-device/reports/browser-reading-locator.txt
+          node scripts/test-toc-location.cjs | tee build/kokoro-device/reports/browser-toc-location.txt
           test -s build/screenshots/09-sleep-timer-mobile.png
           test -s build/screenshots/10-sleep-timer-dark.png
+          test -s build/screenshots/toc-current-heading.png
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
