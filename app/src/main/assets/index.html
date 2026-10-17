@@ -7,12 +7,12 @@
 <label for="speechSource">朗读来源（每次启动默认离线）</label><select id="speechSource"><option value="offline">系统离线 TTS</option><option value="QWEN">Qwen 官方云语音（实验）</option><option value="MINIMAX">MiniMax 官方云语音（实验）</option></select>
 <div id="cloudControls" hidden><button id="configureCloud">配置所选云服务商</button><button id="previewCloud">发送前确认并试听统一样例</button><button id="cloudStop">停止</button><p class="hint">真实接口已接入但尚未用账号实测。每个片段均会显示服务商、地址、全文和费用提示，经你确认后才发送。密钥只在原生配置窗口输入，勿填入模型或地址。切回离线不会发送云请求。</p></div>
 <p id="voiceStatus" role="status"></p>
-<div id="offlineControls"><button id="offlineVoiceCenter">离线包安装与配置</button><label for="engineChoice">已安装的系统语音引擎（选择后立即切换）</label><select id="engineChoice"></select><button id="switchEngine">重试所选引擎</button>
+<div id="offlineControls"><button id="kokoroSetup">下载 / 管理内置 Kokoro 中文包（实验）</button><button id="offlineVoiceCenter">离线包安装与配置</button><label for="engineChoice">已安装的语音引擎（选择后立即切换）</label><select id="engineChoice"></select><button id="switchEngine">重试所选引擎</button>
 <p id="voiceEngine">语音引擎初始化中…</p><p id="voiceCurrent"></p>
 <label for="voiceChoice">已安装的离线中文音色</label><select id="voiceChoice"></select>
 <label for="voiceRate">语速 <output id="rateValue">1.00×</output></label><input id="voiceRate" type="range" min="0.5" max="1.5" step="0.05" value="1">
 <details><summary>本次会话语音诊断（不含正文）</summary><pre id="voiceDiagnostics"></pre></details><div class="voice-actions"><button id="saveVoice">保存设置</button><button id="previewVoice">保存并试听</button><button id="voicePauseResume" disabled>暂停（按片段恢复）</button><button id="voiceStop">停止</button></div>
-<p class="hint">中文正文选中文音色。自然度和情感由手机语音引擎决定，改语言或语速不会自动变成有感情的朗读。这里只使用引擎报告为已安装的离线音色，不下载或调用在线服务。点“离线包安装与配置”查看中文模型来源并打开引擎管理；实际下载和模型配置由独立兼容 Android TTS 引擎完成。系统可能在服务不可用时回退；下方显示的是请求使用的引擎。</p>
+<p class="hint">中文正文选中文音色。自然度和情感由手机语音引擎决定，改语言或语速不会自动变成有感情的朗读。系统引擎只列出其报告已安装的离线音色。内置Kokoro需先主动下载并校验，完成后离线合成。点“离线包安装与配置”查看中文模型来源并打开引擎管理；实际下载和模型配置由独立兼容 Android TTS 引擎完成。系统可能在服务不可用时回退；下方显示的是请求使用的引擎。</p>
 </div>
 </section>
 <section id="morePanel" class="panel" hidden aria-label="更多设置"><div class="panel-heading"><strong>更多</strong><button id="closeMore" aria-label="关闭更多设置">关闭</button></div><div class="more-grid"><button id="open">导入文档</button><button id="theme">夜间模式</button><button id="smaller" aria-label="缩小字号">字号 A−</button><button id="larger" aria-label="放大字号">字号 A+</button><button id="voiceSettings">声音设置</button></div><p class="hint">轻点正文显示或隐藏底栏。滑动仅用于阅读；选字和公式区域不会切换底栏。朗读从当前正文段连续往后播放，选中文字只读选中部分。按钮变为停止可取消，重播从当前段落起读。声音设置可选择系统离线引擎，或配置需逐片段确认的实验性云 TTS。</p></section>

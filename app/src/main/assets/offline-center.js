@@ -12,3 +12,5 @@
     }
   });
 })();
+
+document.getElementById("kokoroSetup")?.addEventListener("click", () => { if(window.Native?.openKokoroSetup) { closePanels(); window.Native.openKokoroSetup(); } else { document.getElementById("voiceStatus").textContent="Kokoro内置下载仅在包含原生库的Android实验构建可用。"; } });

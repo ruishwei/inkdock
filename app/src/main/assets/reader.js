@@ -43,7 +43,7 @@ function clearHighlight(){document.querySelectorAll('.speaking').forEach(el=>el.
 function cancelReading(){$('voicePauseResume').disabled=true;offlineQueueId=null;reading=null;clearHighlight();updatePlayButton(false);bridge?.stopSpeaking();}
 window.stopForEngineChange=()=>{cancelReading();readingStatus('切换语音引擎，朗读已停止。');};
 window.stopForBackground=()=>{if($('speechSource').value==='offline')return;reading=null;clearHighlight();updatePlayButton(false);readingStatus('云朗读在后台暂停；返回后重新点击朗读并确认片段。');};
-function speechParts(text){return InkSpeech.splitText(text,$('speechSource').value==='offline'?2800:600);}
+function speechParts(text){return $('speechSource').value==='offline'?InkSpeech.splitOfflineText(text).filter(part=>part.trim()):InkSpeech.splitText(text,600);}
 function blockSpeech(index){const block=book.blocks[index];if(!block||['heading','code','hr','displayMath'].includes(block.token.type))return '';
  const holder=document.createElement('div');holder.innerHTML=safeHtml(block);holder.querySelectorAll('.katex').forEach(el=>el.replaceWith(document.createTextNode('（公式）')));
  const value=(holder.textContent||'').trim();return value.replace(/[（()）\s]/g,'')==='公式'?'':value;
@@ -70,8 +70,8 @@ $('speak').onclick=()=>{
 };
 function startOfflineQueue(selected){
  const entries=[];
- if(selected){for(const text of InkSpeech.splitText(selected))entries.push({text,block:-1});}
- else for(let block=current;block<book.blocks.length;block++)for(const text of InkSpeech.splitText(blockSpeech(block)))entries.push({text,block});
+ if(selected){for(const text of InkSpeech.splitOfflineText(selected))if(text.trim())entries.push({text,block:-1});}
+ else for(let block=current;block<book.blocks.length;block++)for(const text of InkSpeech.splitOfflineText(blockSpeech(block),entries.length===0))if(text.trim())entries.push({text,block});
  if(!entries.length){readingStatus('没有可朗读的正文段落；标题、纯公式和代码块会跳过。');return;}
  // No IPC Intent carries document text; native owns and validates the complete queue.
  const queueId='offline-'+Date.now()+'-'+(++requestCounter);
