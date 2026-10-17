@@ -5,6 +5,7 @@ import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.speech.tts.Voice
+import java.io.File
 
 /** The service is the only production owner of an Android TTS connection. */
 internal interface OfflineSpeechEngine {
@@ -17,6 +18,12 @@ internal interface OfflineSpeechEngine {
     fun setAudioAttributes(attributes: AudioAttributes): Int
     fun setOnUtteranceProgressListener(listener: UtteranceProgressListener): Int
     fun speak(text: String, queueMode: Int, params: Bundle?, utteranceId: String): Int
+    fun synthesizeToFile(text: String, params: Bundle, file: File, utteranceId: String): Int = TextToSpeech.ERROR
+    fun prefetch(text: String, utteranceId: String) {}
+    val bufferingMode: String get() = "direct"
+    val bufferedSlots: Int get() = 0
+    val nextAudioReady: Boolean get() = false
+    val retainedAudioBuffers: Int get() = bufferedSlots
     fun stop(): Int
     fun shutdown()
 }
@@ -30,6 +37,7 @@ internal class AndroidOfflineSpeechEngine(private val tts: TextToSpeech) : Offli
     override fun setAudioAttributes(attributes: AudioAttributes) = tts.setAudioAttributes(attributes)
     override fun setOnUtteranceProgressListener(listener: UtteranceProgressListener) = tts.setOnUtteranceProgressListener(listener)
     override fun speak(text: String, queueMode: Int, params: Bundle?, utteranceId: String) = tts.speak(text, queueMode, params, utteranceId)
+    override fun synthesizeToFile(text: String, params: Bundle, file: File, utteranceId: String) = tts.synthesizeToFile(text, params, file, utteranceId)
     override fun stop() = tts.stop()
     override fun shutdown() = tts.shutdown()
 }
