@@ -123,3 +123,15 @@ test('import closes more panel and reports native Back state before picker launc
  h.nodes.moreButton.onclick();h.nodes.open.onclick();
  assert.deepEqual(order.slice(-2),[['panel',false],['import',true]]);
 });
+
+test('engine dropdown switches immediately instead of waiting for a second button',()=>{
+ const h=readerHarness();h.state();h.nodes.engineChoice.value='synthetic.vox';h.nodes.engineChoice.onchange();
+ assert.deepEqual(h.calls.slice(-2),[['stop'],['engine','synthetic.vox']]);
+ assert.match(h.nodes.voiceEngine.textContent,/synthetic.vox/);
+});
+
+test('unavailable requested engine remains a selectable retry target, never empty default',()=>{
+ const h=readerHarness();h.state({enginePackage:'removed.synthetic.engine',engines:[]});
+ assert.ok(h.nodes.engineChoice.children.some(option=>option.value==='removed.synthetic.engine'));
+ h.nodes.switchEngine.onclick();assert.deepEqual(h.calls.at(-1),['engine','removed.synthetic.engine']);
+});
