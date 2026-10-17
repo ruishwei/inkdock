@@ -90,3 +90,36 @@ test('engine/background stops invalidate pending continuous-read advancement',()
   assert.equal(h.read('reading'),null);assert.equal(h.read('playing'),false);
  }
 });
+
+
+test('offline sends complete selection once and never advances through WebView callbacks',()=>{
+ const h=readerHarness();h.state();
+ h.context.Native.speakOfflineQueue=payload=>h.calls.push(['queue',JSON.parse(payload)]);
+ h.start('合成测试句。'.repeat(800));
+ const request=h.calls.find(call=>call[0]==='queue')[1];
+ assert.ok(request.entries.length>1);
+ assert.equal(request.entries.map(part=>part.text).join(''),'合成测试句。'.repeat(800));
+ assert.ok(request.entries.every(part=>part.block===-1));
+ h.context.onOfflineQueueStatus({queueId:request.queueId,phase:'started',block:-1});
+ h.context.stopForBackground();h.flushTimers();
+ assert.equal(h.calls.filter(call=>call[0]==='queue').length,1);
+ assert.equal(h.read('offlineQueueId'),request.queueId);
+ h.context.onOfflineQueueStatus({queueId:request.queueId,phase:'done'});
+ assert.equal(h.read('offlineQueueId'),null);
+});
+test('offline stop rejects stale updates and explicit restore accepts service snapshot',()=>{
+ const h=readerHarness();h.state();h.context.Native.speakOfflineQueue=payload=>h.calls.push(['queue',JSON.parse(payload)]);
+ h.start('合成测试');const request=h.calls.find(call=>call[0]==='queue')[1];
+ h.nodes.speak.onclick();assert.equal(h.read('offlineQueueId'),null);
+ h.context.onOfflineQueueStatus({queueId:request.queueId,phase:'started'});assert.equal(h.read('playing'),false);
+ h.context.onOfflineQueueStatus({queueId:'restored',phase:'paused',restore:true});assert.equal(h.read('offlineQueueId'),'restored');
+ h.context.onOfflineQueueStatus({phase:'error',restore:true});assert.equal(h.read('offlineQueueId'),null);assert.equal(h.read('playing'),false);
+});
+
+test('import closes more panel and reports native Back state before picker launch',()=>{
+ const h=readerHarness();const order=[];
+ h.context.Native.panelState=open=>order.push(['panel',open]);
+ h.context.Native.openDocument=()=>order.push(['import',h.nodes.morePanel.hidden]);
+ h.nodes.moreButton.onclick();h.nodes.open.onclick();
+ assert.deepEqual(order.slice(-2),[['panel',false],['import',true]]);
+});
