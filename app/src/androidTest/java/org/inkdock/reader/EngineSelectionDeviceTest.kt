@@ -111,6 +111,30 @@ class EngineSelectionDeviceTest {
             }
         }
 
+    @Test fun missingNativeModelSelectionSurvivesMaintenanceWithoutSystemFallback() =
+        withVoicePreferencesRestored { prefs ->
+            // No model is installed, downloaded, removed, or mutated by this test.
+            org.junit.Assume.assumeFalse("Requires the ordinary model-free test environment", KokoroRepository.get(context).isReady())
+            val nativeId = KokoroOfflineSpeechEngine.ID
+            assertTrue(prefs.edit().putString("voice.engine", nativeId).commit())
+            withReader { _, activity, _ ->
+                awaitService(activity)
+                await("Missing native model stays unavailable") { settings(activity).optString("engineState") == "unavailable" }
+                onMain { service(activity)!!.releaseKokoroForMaintenance() }
+                assertEquals("maintenance", settings(activity).getString("engineState"))
+                assertEquals(nativeId, prefs.getString("voice.engine", null))
+                assertFalse(settings(activity).getBoolean("initialized"))
+                onMain { service(activity)!!.resumeKokoroAfterMaintenance() }
+                val after = settings(activity)
+                assertEquals(nativeId, after.getString("enginePackage"))
+                assertEquals(nativeId, prefs.getString("voice.engine", null))
+                assertEquals("unavailable", after.getString("engineState"))
+                assertFalse(after.getBoolean("initialized"))
+                assertFalse(after.getBoolean("loading"))
+                assertEquals("", after.getString("current"))
+            }
+        }
+
     private fun selectFixtureAndAssertImmediateSave(activity: MainActivity, prefs: SharedPreferences) = onMain {
         // Invoke the actual JavascriptInterface implementation on the main thread. Its init
         // callback is posted, so this assertion happens before asynchronous initialization.
