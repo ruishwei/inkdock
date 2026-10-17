@@ -10,6 +10,8 @@ import json
 import os
 from pathlib import Path
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -159,6 +161,51 @@ class DistributionTests(unittest.TestCase):
         struct.pack_into("<Q", data, 40, len(data) - 1)
         with self.assertRaisesRegex(RuntimeError, "section headers"):
             dist.inspect_library(data, dist.ABI, native.LIBRARIES[0], stripped=True)
+
+    def workflow_tree_requests(self, *, invalid_tree=False):
+        path = self.root / "workflow-evidence"
+        docs = evidence(path)
+        docs["device-commit.json"]["tree"]["sha"] = "f" * 40
+        dist.write_json(path / "device-commit.json", docs["device-commit.json"])
+        if invalid_tree:
+            docs["current-commit.json"]["tree"]["sha"] = "not-a-tree-id; exit 0"
+            dist.write_json(path / "current-commit.json", docs["current-commit.json"])
+        workflow = (ROOT / ".github/workflows/kokoro-arm64-distribution.yml").read_text()
+        prefixes = ("CURRENT_TREE=", "DEVICE_TREE=", 'gh api "repos/ruishwei/inkdock/git/trees/')
+        commands = [line.strip() for line in workflow.splitlines() if line.strip().startswith(prefixes)]
+        self.assertEqual(len(commands), 4)
+        # This executable is a local stand-in, never the real gh client. It rejects
+        # commit IDs so the old workflow acquisition path cannot pass this fixture.
+        tools = self.root / "fake-tools"
+        tools.mkdir()
+        gh = tools / "gh"
+        gh.write_text("#!" + sys.executable + "\n" +
+                      "import json,os,pathlib,sys\n" +
+                      "endpoints=['repos/ruishwei/inkdock/git/trees/' + value*40 + '?recursive=1' for value in 'bf']\n" +
+                      "assert len(sys.argv)==3 and sys.argv[1]=='api' and sys.argv[2] in endpoints, sys.argv\n" +
+                      "endpoint=sys.argv[2]\n" +
+                      "p=pathlib.Path(os.environ['EVIDENCE'])\n" +
+                      "with (p/'fake-gh-calls.txt').open('a') as f: f.write(endpoint+'\\n')\n" +
+                      "print(json.dumps({'sha':endpoint.split('/')[-1].split('?')[0],'tree':[],'truncated':False}))\n")
+        gh.chmod(0o755)
+        env = {**os.environ, "EVIDENCE": str(path), "GITHUB_SHA": "a" * 40,
+               "DEVICE_COMMIT": "d" * 40, "PATH": str(tools) + os.pathsep + os.environ["PATH"]}
+        result = subprocess.run(["bash", "-c", "set -euo pipefail\n" + "\n".join(commands)],
+                                cwd=self.root, env=env, capture_output=True, text=True)
+        return result, path
+
+    def test_workflow_requests_tree_ids_from_commit_objects(self):
+        result, path = self.workflow_tree_requests()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((path / "fake-gh-calls.txt").read_text().splitlines(),
+                         ["repos/ruishwei/inkdock/git/trees/" + value * 40 + "?recursive=1" for value in "bf"])
+        for prefix, expected in (("current", "b"), ("device", "f")):
+            self.assertEqual(json.loads((path / (prefix + "-tree.json")).read_text())["sha"], expected * 40)
+
+    def test_workflow_rejects_malformed_tree_id_before_api_request(self):
+        result, path = self.workflow_tree_requests(invalid_tree=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((path / "fake-gh-calls.txt").exists())
 
     def test_evidence_success(self):
         evidence(self.root / "evidence")
