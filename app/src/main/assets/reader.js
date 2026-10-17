@@ -16,34 +16,39 @@ function render(target=0){
   requestAnimationFrame(()=>{document.getElementById(`p-${current}`)?.scrollIntoView();persist();});
 }
 function buildToc(){
-  $('toc').replaceChildren();const stack=[{level:0,el:$('toc')}];
-  for(const h of book.headings){while(stack.length>1&&stack.at(-1).level>=h.level)stack.pop();
-    const details=document.createElement('details');details.open=h.level<=2;
-    const summary=document.createElement('summary');summary.textContent=h.title;
-    const button=document.createElement('button');button.textContent='阅读此节';button.onclick=()=>{closePanels();render(h.block);};
-    details.append(summary,button);stack.at(-1).el.append(details);stack.push({level:h.level,el:details});
-  }
-  if(!book.headings.length)$('toc').textContent='此文档没有 # 标题。';
+ $('toc').replaceChildren();const roots=[],stack=[];
+ for(const h of book.headings){const node={...h,children:[]};while(stack.length&&stack.at(-1).level>=h.level)stack.pop();(stack.length?stack.at(-1).children:roots).push(node);stack.push(node);}
+ function append(nodes,parent){for(const h of nodes){
+  const wrapper=document.createElement('div'),row=document.createElement('div');row.className='toc-row';
+  const title=document.createElement('button');title.className='toc-title';title.textContent=h.title;title.onclick=()=>{closePanels();render(h.block);};
+  if(h.children.length){const arrow=document.createElement('button'),children=document.createElement('div');arrow.className='toc-toggle';children.className='toc-children';children.id='toc-children-'+h.block;children.hidden=h.level>2;
+   function update(){arrow.textContent=children.hidden?'›':'⌄';arrow.setAttribute('aria-expanded',String(!children.hidden));arrow.setAttribute('aria-label',(children.hidden?'展开':'收起')+h.title);}
+   arrow.setAttribute('aria-controls',children.id);arrow.onclick=()=>{children.hidden=!children.hidden;update();};update();row.append(arrow,title);wrapper.append(row,children);append(h.children,children);
+  }else{const spacer=document.createElement('span');spacer.className='toc-spacer';row.append(spacer,title);wrapper.append(row);}
+  parent.append(wrapper);
+ }}
+ append(roots,$('toc'));if(!book.headings.length)$('toc').textContent='此文档没有标题。';
 }
 function persist(){if(bridge)bridge.saveProgress(current,size,document.body.classList.contains('dark'));}
-window.loadDocument=(text,anchor=0,font=20,dark=false)=>{book=InkEngine.indexDocument(text);size=Math.max(14,Math.min(32,font));$('content').style.fontSize=`${size}px`;document.body.classList.toggle('dark',dark);buildToc();render(anchor);};
+window.loadDocument=(text,anchor=0,font=20,dark=false)=>{book=InkEngine.indexDocument(text);size=Math.max(14,Math.min(32,font));$('content').style.fontSize=`${size}px`;document.body.classList.toggle('dark',dark);$('theme').textContent=dark?'日间模式':'夜间模式';buildToc();render(anchor);};
 $('open').onclick=()=>bridge?.openDocument();$('tocButton').onclick=()=>openPanel('tocPanel');
 $('prev').onclick=()=>render(Math.max(0,(page-1)*40));$('next').onclick=()=>render(Math.min(book.blocks.length-1,(page+1)*40));
 $('smaller').onclick=()=>{size=Math.max(14,size-2);$('content').style.fontSize=`${size}px`;persist();};
 $('larger').onclick=()=>{size=Math.min(32,size+2);$('content').style.fontSize=`${size}px`;persist();};
-$('theme').onclick=()=>{document.body.classList.toggle('dark');persist();};
+$('theme').onclick=()=>{document.body.classList.toggle('dark');$('theme').textContent=document.body.classList.contains('dark')?'日间模式':'夜间模式';persist();};
 let speakSelection='';
 $('speak').addEventListener('pointerdown',()=>{speakSelection=window.getSelection()?.toString()||'';});
-$('speak').onclick=()=>{const selection=speakSelection||window.getSelection()?.toString();speakSelection='';bridge?.speak((selection||document.getElementById(`p-${current}`)?.innerText||'').slice(0,3500));};
-$('stop').onclick=()=>bridge?.stopSpeaking();
+$('speak').onclick=()=>{if(playing){bridge?.stopSpeaking();return;}const selection=speakSelection||window.getSelection()?.toString();speakSelection='';bridge?.speak((selection||document.getElementById(`p-${current}`)?.innerText||'').slice(0,3500));};
+let playing=false;
+window.setPlaybackState=active=>{playing=!!active;$('playIcon').toggleAttribute('hidden',playing);$('stopIcon').toggleAttribute('hidden',!playing);$('speak').setAttribute('aria-label',playing?'停止朗读':'朗读当前段落或所选文字');$('speak').title=playing?'停止朗读':'朗读';};
 window.addEventListener('scroll',()=>{clearTimeout(saveTimer);saveTimer=setTimeout(()=>{const sections=[...$('content').children];const visible=sections.find(el=>el.getBoundingClientRect().bottom>16);if(visible){current=Number(visible.dataset.index);persist();}},200);});
 function showToolbar(visible){
  $('toolbar').classList.toggle('is-hidden',!visible);$('toolbar').inert=!visible;
- $('toolbar').setAttribute('aria-hidden',String(!visible));$('showTools').hidden=visible;
+ $('toolbar').setAttribute('aria-hidden',String(!visible));
 }
-function closePanels(){for(const id of ['tocPanel','voicePanel'])$(id).hidden=true;}
-function openPanel(id){closePanels();showToolbar(true);$(id).hidden=false;}
-$('showTools').onclick=()=>showToolbar(true);
+function closePanels(){for(const id of ['tocPanel','voicePanel','morePanel'])$(id).hidden=true;}
+function openPanel(id){cancelTap();closePanels();showToolbar(true);$(id).hidden=false;}
+$('moreButton').onclick=()=>openPanel('morePanel');$('closeMore').onclick=closePanels;
 $('closeToc').onclick=closePanels;$('closeVoice').onclick=closePanels;
 $('voiceSettings').onclick=()=>{openPanel('voicePanel');bridge?.getVoiceSettings();};
 $('voiceRate').oninput=()=>{$('rateValue').textContent=Number($('voiceRate').value).toFixed(2)+'×';};
@@ -60,21 +65,27 @@ window.setVoiceSettings=state=>{
  $('voiceRate').value=state.rate||1;$('voiceRate').oninput();
  $('voiceStatus').textContent=state.message||(available?'仅列出引擎报告为已安装的离线中文音色。':'没有可用的离线中文音色，请在手机系统 TTS 设置中安装后重启应用。');
 };
-// Passive touch handling never preventDefault()s scrolling, selection or system navigation.
-let gesture=null;
+// Only a stationary, short tap toggles tools. Swipes never trigger actions.
+let tap=null,tapTimer,lastScroll=-Infinity,lastTap=-Infinity;
 function hasSelection(){return !!window.getSelection()?.toString();}
 function excludedTarget(target){return !!target.closest('button,a,input,select,textarea,summary,.panel,#toolbar,pre,code,table,.katex,.katex-display');}
-$('content').addEventListener('touchstart',event=>{
- if(event.touches.length!==1){gesture=null;return;}
- const t=event.touches[0];gesture={x:t.clientX,y:t.clientY,at:performance.now(),blocked:excludedTarget(event.target),selected:hasSelection()};
-},{passive:true});
-$('content').addEventListener('touchmove',event=>{if(event.touches.length!==1)gesture=null;},{passive:true});
-$('content').addEventListener('touchcancel',()=>{gesture=null;},{passive:true});
-$('content').addEventListener('touchend',event=>{
- const start=gesture;gesture=null;if(!start||event.changedTouches.length!==1||event.touches.length)return;
- const t=event.changedTouches[0];const action=InkGestures.classify({dx:t.clientX-start.x,dy:t.clientY-start.y,duration:performance.now()-start.at,startX:start.x,width:innerWidth,blocked:start.blocked||!$('tocPanel').hidden||!$('voicePanel').hidden,selected:start.selected||hasSelection()});
- if(action==='show')showToolbar(true);if(action==='hide')showToolbar(false);if(action==='toc')openPanel('tocPanel');
-},{passive:true});
+function cancelTap(){tap=null;clearTimeout(tapTimer);}
+window.addEventListener('scroll',()=>{lastScroll=performance.now();cancelTap();},{capture:true,passive:true});
+$('content').addEventListener('pointerdown',event=>{
+ clearTimeout(tapTimer);const now=performance.now();
+ if(!event.isPrimary||event.button!==0){cancelTap();return;}
+ tap={id:event.pointerId,x:event.clientX,y:event.clientY,at:now,distance:0,blocked:excludedTarget(event.target)||now-lastTap<350,selected:hasSelection()};
+});
+$('content').addEventListener('pointermove',event=>{if(tap&&tap.id===event.pointerId)tap.distance=Math.max(tap.distance,Math.hypot(event.clientX-tap.x,event.clientY-tap.y));},{passive:true});
+$('content').addEventListener('pointercancel',cancelTap,{passive:true});
+$('content').addEventListener('touchstart',event=>{if(event.touches.length>1)cancelTap();},{passive:true});
+$('content').addEventListener('pointerup',event=>{
+ const start=tap;tap=null;if(!start||start.id!==event.pointerId)return;
+ const now=performance.now();lastTap=now;
+ const accepted=InkGestures.isTap({distance:Math.max(start.distance,Math.hypot(event.clientX-start.x,event.clientY-start.y)),duration:now-start.at,sinceScroll:now-lastScroll,blocked:start.blocked||['tocPanel','voicePanel','morePanel'].some(id=>!$(id).hidden),selected:start.selected||hasSelection()});
+ if(accepted)tapTimer=setTimeout(()=>{if(!hasSelection()&&performance.now()-lastScroll>=450)showToolbar($('toolbar').classList.contains('is-hidden'));},320);
+});
+$('content').addEventListener('keydown',event=>{if(event.key==='Enter'&&event.target===$('content')&&!hasSelection()){event.preventDefault();showToolbar($('toolbar').classList.contains('is-hidden'));}});
 function measureTools(){document.documentElement.style.setProperty('--tools-height',$('toolbar').offsetHeight+'px');}
 new ResizeObserver(measureTools).observe($('toolbar'));measureTools();
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){closePanels();showToolbar(true);}});

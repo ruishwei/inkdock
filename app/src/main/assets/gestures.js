@@ -1,10 +1,7 @@
-/* Pure direction classifier. Never captures native scrolling or edge-back gestures. */
+/* No swipe actions. A deliberate stationary tap may toggle reading controls. */
 (function(root){
- function classify({dx,dy,duration,startX,width,blocked=false,selected=false,multi=false}){
-  if(blocked||selected||multi||duration>700||duration<0)return null;
-  if(Math.abs(dy)>=48&&Math.abs(dy)>Math.abs(dx)*1.5)return dy>0?'show':'hide';
-  if(startX>=32&&startX<=width-32&&dx>=80&&dx>Math.abs(dy)*2&&Math.abs(dy)<50)return 'toc';
-  return null;
+ function isTap({distance=0,duration=0,sinceScroll=Infinity,blocked=false,selected=false,multi=false}){
+  return !blocked&&!selected&&!multi&&distance<=10&&duration>=0&&duration<=350&&sinceScroll>=450;
  }
- const api={classify};if(typeof module==='object')module.exports=api;else root.InkGestures=api;
+ const api={isTap};if(typeof module==='object')module.exports=api;else root.InkGestures=api;
 })(typeof globalThis==='object'?globalThis:this);

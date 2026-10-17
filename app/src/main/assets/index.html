@@ -1,6 +1,6 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=3,viewport-fit=cover"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'none'; connect-src 'none'"><title>InkDock</title><link rel="stylesheet" href="vendor/katex.css"><link rel="stylesheet" href="reader.css"></head>
 <body>
-<main id="content"></main>
+<main id="content" tabindex="0" aria-label="阅读正文，按回车切换底栏"></main>
 <footer><button id="prev">上一组</button><span id="status"></span><button id="next">下一组</button></footer>
 <nav id="tocPanel" class="panel" hidden aria-label="章节目录"><div class="panel-heading"><strong>目录</strong><button id="closeToc">关闭</button></div><div id="toc"></div></nav>
 <section id="voicePanel" class="panel" hidden aria-label="朗读设置"><div class="panel-heading"><strong>朗读设置</strong><button id="closeVoice">关闭</button></div>
@@ -10,6 +10,10 @@
 <p id="voiceStatus" role="status"></p><div class="voice-actions"><button id="saveVoice">保存设置</button><button id="previewVoice">保存并试听</button><button id="voiceStop">停止</button></div>
 <p class="hint">中文正文选中文音色。自然度和情感由手机语音引擎决定，改语言或语速不会自动变成有感情的朗读。这里只使用已安装的离线音色，不下载或调用在线服务。</p>
 </section>
-<div id="toolbar" role="toolbar" aria-label="阅读工具"><button id="open">导入</button><button id="tocButton">目录</button><button id="smaller" aria-label="缩小字号">A−</button><button id="larger" aria-label="放大字号">A+</button><button id="theme">夜间</button><button id="speak">朗读</button><button id="stop">停止</button><button id="voiceSettings">声音</button><span class="gesture-hint">下划显示工具 · 上划收起 · 正文右滑目录</span></div>
-<button id="showTools" hidden aria-label="显示阅读工具">工具</button>
+<section id="morePanel" class="panel" hidden aria-label="更多设置"><div class="panel-heading"><strong>更多</strong><button id="closeMore" aria-label="关闭更多设置">关闭</button></div><div class="more-grid"><button id="open">导入文档</button><button id="theme">夜间模式</button><button id="smaller" aria-label="缩小字号">字号 A−</button><button id="larger" aria-label="放大字号">字号 A+</button><button id="voiceSettings">声音设置</button></div><p class="hint">轻点正文显示或隐藏底栏。滑动仅用于阅读；选字和公式区域不会切换底栏。朗读按钮在播放时变为停止，再次播放从当前段落起读，不是断点暂停。</p></section>
+<div id="toolbar" role="toolbar" aria-label="阅读工具">
+<button id="tocButton" class="icon-button" aria-label="打开目录" title="目录"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5h13M8 12h13M8 19h13M3 5h.01M3 12h.01M3 19h.01"/></svg></button>
+<button id="speak" class="icon-button" aria-label="朗读当前段落或所选文字" title="朗读"><svg id="playIcon" viewBox="0 0 24 24" aria-hidden="true"><path d="m8 4 12 8-12 8Z"/></svg><svg id="stopIcon" viewBox="0 0 24 24" aria-hidden="true" hidden><path d="M6 6h12v12H6Z"/></svg></button>
+<button id="moreButton" class="icon-button" aria-label="打开更多设置" title="更多"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></svg></button>
+</div>
 <script src="vendor/marked.js"></script><script src="vendor/purify.js"></script><script src="vendor/katex.js"></script><script src="engine.js"></script><script src="gestures.js"></script><script src="reader.js"></script></body></html>
