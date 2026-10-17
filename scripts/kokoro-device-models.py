@@ -140,7 +140,8 @@ class Device:
         require(serial == "emulator-5554", "Only the dedicated emulator-5554 is supported")
         require(os.environ.get("INKDOCK_EPHEMERAL_DEVICE_TEST") == "1", "Staging/collection is restricted to the explicit disposable CI emulator run")
         self.command = ["adb", "-s", serial]
-        require("shell_v2" in self.text("features").strip().split(","),
+        features = set(re.split(r"[,\s]+", self.text("features").strip()))
+        require("shell_v2" in features,
                 "ADB shell_v2 is required for binary stdin EOF and remote exit status")
         require(self.text("shell", "getprop", "ro.kernel.qemu").strip() == "1", "Refusing a physical device")
         require(self.text("shell", "getprop", "ro.build.version.sdk").strip() == "35", "Expected Android API 35")
@@ -338,6 +339,10 @@ def transfer_self_test(directory):
             checks += 1
         else:
             raise AssertionError("Accepted missing remote exit protocol")
+    for output in ("cmd,shell_v2,stat_v2", "cmd\nshell_v2\nstat_v2\n", "cmd\r\nshell_v2\r\nstat_v2\r\n"):
+        with patch.dict(os.environ, {"INKDOCK_EPHEMERAL_DEVICE_TEST": "1"}), patch.object(Device, "text", side_effect=[output, "1", "35", "x86_64", "/data/user/0/" + PACKAGE]):
+            Device("emulator-5554")
+            checks += 1
     expected_sha = hashlib.sha256(binary).hexdigest()
     with patch.object(device, "private", side_effect=[str(len(binary)), expected_sha]), contextlib.redirect_stdout(io.StringIO()):
         verify_private_file(device, remote, len(binary), expected_sha)
