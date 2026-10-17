@@ -89,13 +89,31 @@ jobs:
         run: |
           mkdir -p build/android-regression
           export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          export ANDROID_USER_HOME="$RUNNER_TEMP/inkdock-android-user"
+          export ANDROID_AVD_HOME="$ANDROID_USER_HOME/avd"
+          mkdir -p "$ANDROID_AVD_HOME"
           # "no" declines custom hardware configuration; SDK license terms are not accepted here.
-          printf 'no\n' | avdmanager create avd --force --name inkdock-api35 --package 'system-images;android-35;google_apis;x86_64' --device pixel_6
+          printf 'no\n' | avdmanager create avd --force --name inkdock-api35 --package 'system-images;android-35;google_apis;x86_64' --device pixel_6 --path "$ANDROID_AVD_HOME/inkdock-api35.avd"
+          test -f "$ANDROID_AVD_HOME/inkdock-api35.ini"
+          emulator -list-avds | tee build/android-regression/avd-list.txt
+          grep -Fx inkdock-api35 build/android-regression/avd-list.txt
           emulator -avd inkdock-api35 -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect > build/android-regression/emulator.log 2>&1 &
           EMULATOR_PID=$!
-          trap 'adb logcat -d > build/android-regression/logcat.txt 2>&1 || true; adb shell dumpsys activity activities > build/android-regression/activities.txt 2>&1 || true; adb emu kill || true; kill "$EMULATOR_PID" 2>/dev/null || true' EXIT
-          timeout 300 adb wait-for-device
-          timeout 300 bash -c 'until [[ "$(adb shell getprop sys.boot_completed | tr -d "\r")" == "1" ]]; do sleep 2; done'
+          trap 'timeout 10 adb logcat -d > build/android-regression/logcat.txt 2>&1 || true; timeout 10 adb shell dumpsys activity activities > build/android-regression/activities.txt 2>&1 || true; timeout 10 adb emu kill || true; kill "$EMULATOR_PID" 2>/dev/null || true' EXIT
+          BOOTED=false
+          for attempt in $(seq 1 150); do
+            if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
+              cat build/android-regression/emulator.log
+              echo '::error::Emulator exited before boot.'
+              exit 1
+            fi
+            if [[ "$(timeout 3 adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)" == 1 ]]; then
+              BOOTED=true
+              break
+            fi
+            sleep 2
+          done
+          [[ "$BOOTED" == true ]] || { cat build/android-regression/emulator.log; echo '::error::Emulator boot timed out.'; exit 1; }
           adb shell input keyevent 82
           adb shell settings put global window_animation_scale 0
           adb shell settings put global transition_animation_scale 0
