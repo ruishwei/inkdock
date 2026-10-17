@@ -27,7 +27,7 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts && npm run vendor && git diff --exit-code -- app/src/main/assets/vendor && npm test
       - run: npx playwright-core install --with-deps chromium
-      - run: node scripts/browser-smoke.cjs
+      - run: node scripts/browser-smoke.cjs && node scripts/test-voice-ui.cjs
       - uses: actions/upload-artifact@v4
         if: always()
         with:
