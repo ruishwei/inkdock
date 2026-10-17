@@ -128,6 +128,8 @@ jobs:
           name: InkDock-Android15-regression
           path: |
             build/android-regression/
+            app/build/reports/lint-results-debug.*
+            app/build/intermediates/lint_intermediate_text_report/
             app/build/reports/androidTests/
             app/build/outputs/androidTest-results/
             app/build/reports/tests/
