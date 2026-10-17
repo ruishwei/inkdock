@@ -5,7 +5,9 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
-import android.view.View
+import android.speech.tts.UtteranceProgressListener
+import android.speech.tts.Voice
+import android.widget.FrameLayout
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -13,6 +15,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
 import org.json.JSONObject
+import org.json.JSONArray
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.security.MessageDigest
@@ -24,6 +27,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     private lateinit var web: WebView
     private var tts: TextToSpeech? = null
     private var ttsReady = false
+    private var ttsInitialized = false
     private var ready = false
     private var text = ""
     private var documentId = "sample"
@@ -37,13 +41,17 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         web = WebView(this)
         web.setBackgroundColor(0xfffaf7ef.toInt())
         // Android 15 enforces edge-to-edge. Keep controls outside system bars.
-        web.setOnApplyWindowInsetsListener { view, insets ->
+        val root = FrameLayout(this)
+        root.addView(web, FrameLayout.LayoutParams(-1, -1))
+        root.setOnApplyWindowInsetsListener { view, insets ->
             val bars = insets.systemWindowInsetTop
             view.setPadding(insets.systemWindowInsetLeft, bars, insets.systemWindowInsetRight, insets.systemWindowInsetBottom)
             insets
         }
-        setContentView(web)
-        web.requestApplyInsets()
+        setContentView(root)
+        root.requestApplyInsets()
+        web.isVerticalScrollBarEnabled = false
+        web.isHorizontalScrollBarEnabled = false
         web.settings.javaScriptEnabled = true
         web.settings.allowFileAccess = true
         web.settings.allowContentAccess = false
@@ -121,16 +129,69 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == OPEN && resultCode == RESULT_OK) data?.data?.let(::importUri)
     }
+    private fun offlineVoices(): List<Voice> = if (!ttsInitialized) emptyList() else
+        tts?.voices.orEmpty().filter {
+            it.locale.language == Locale.CHINESE.language && !it.isNetworkConnectionRequired &&
+                !it.features.orEmpty().contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED)
+        }.sortedWith(compareBy({ it.locale.toLanguageTag() }, { it.name }))
+
+    private fun voiceRate() = prefs.getFloat("voice.rate", 1f).coerceIn(0.5f, 1.5f)
+    private fun sendVoiceSettings(message: String = "") {
+        if (!ready || isDestroyed) return
+        val engine = tts
+        val packageName = engine?.defaultEngine.orEmpty()
+        val label = engine?.engines?.firstOrNull { it.name == packageName }?.label ?: packageName
+        val voices = JSONArray()
+        offlineVoices().forEach { voices.put(JSONObject().put("name", it.name).put("language", it.locale.getDisplayName(Locale.SIMPLIFIED_CHINESE))) }
+        val current = if (ttsReady) engine?.voice else null
+        val state = JSONObject().put("engine", label).put("current", current?.name.orEmpty())
+            .put("language", current?.locale?.getDisplayName(Locale.SIMPLIFIED_CHINESE).orEmpty())
+            .put("voices", voices).put("rate", voiceRate()).put("message", message)
+        web.evaluateJavascript("window.setVoiceSettings($state)", null)
+    }
+    private fun configureVoice(name: String, rate: Float): Boolean {
+        val engine = tts ?: return false
+        val voice = offlineVoices().firstOrNull { it.name == name } ?: return false
+        engine.stop()
+        ttsReady = false
+        if (engine.setVoice(voice) != TextToSpeech.SUCCESS || engine.setSpeechRate(rate) != TextToSpeech.SUCCESS) return false
+        // Do not trust a successful request if the engine silently selected a different voice.
+        val actual = engine.voice ?: return false
+        if (actual.name != voice.name || actual.isNetworkConnectionRequired ||
+            actual.features.orEmpty().contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED)) return false
+        ttsReady = true
+        prefs.edit().putString("voice.name", voice.name).putFloat("voice.rate", rate).apply()
+        return true
+    }
+    private fun speakText(value: String) {
+        val engine = tts
+        if (!ttsReady || engine == null || offlineVoices().none { it.name == engine.voice?.name }) {
+            toast("离线中文语音尚未就绪，请打开「声音」检查设置。")
+            return
+        }
+        val result = engine.speak(value.take(minOf(3500, TextToSpeech.getMaxSpeechInputLength())), TextToSpeech.QUEUE_FLUSH, null, "paragraph")
+        if (result != TextToSpeech.SUCCESS) sendVoiceSettings("朗读失败，请检查系统语音引擎或换一个已安装音色。")
+    }
     override fun onInit(status: Int) {
-        if (status == TextToSpeech.SUCCESS) {
-            val engine = tts ?: return
-            val offline = engine.voices?.firstOrNull { it.locale.language == Locale.CHINESE.language && !it.isNetworkConnectionRequired }
-            if (offline != null) { engine.voice = offline; ttsReady = true }
-            else toast("未找到离线中文语音。请在系统文字转语音设置下载中文语音包。")
+        runOnUiThread {
+            ttsInitialized = status == TextToSpeech.SUCCESS
+            if (ttsInitialized) {
+                tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                    override fun onStart(utteranceId: String?) {}
+                    override fun onDone(utteranceId: String?) {}
+                    @Deprecated("Required legacy callback")
+                    override fun onError(utteranceId: String?) { runOnUiThread { sendVoiceSettings("语音引擎未能完成朗读，请检查离线语音包。") } }
+                })
+                val voices = offlineVoices()
+                val saved = prefs.getString("voice.name", null)
+                val choice = voices.firstOrNull { it.name == saved } ?: voices.firstOrNull()
+                if (choice != null) configureVoice(choice.name, voiceRate())
+            }
+            sendVoiceSettings(if (ttsReady) "" else "未找到可用的离线中文语音，请在系统 TTS 设置检查语音包。")
         }
     }
     inner class Bridge {
-        @JavascriptInterface fun ready() = runOnUiThread { ready = true; showDocument() }
+        @JavascriptInterface fun ready() = runOnUiThread { ready = true; showDocument(); sendVoiceSettings() }
         @JavascriptInterface fun openDocument() = runOnUiThread {
             val picker = Intent(Intent.ACTION_OPEN_DOCUMENT).apply { addCategory(Intent.CATEGORY_OPENABLE); type = "*/*" }
             startActivityForResult(picker, OPEN)
@@ -138,10 +199,16 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         @JavascriptInterface fun saveProgress(anchor: Int, font: Int, dark: Boolean) = runOnUiThread {
             prefs.edit().putInt("anchor.$documentId", anchor.coerceAtLeast(0)).putInt("font", font.coerceIn(14, 32)).putBoolean("dark", dark).apply()
         }
-        @JavascriptInterface fun speak(value: String) = runOnUiThread {
-            if (!ttsReady) toast("离线中文语音尚未就绪，请检查系统 TTS 设置。")
-            else tts?.speak(value.take(3500), TextToSpeech.QUEUE_FLUSH, null, "paragraph")
+        @JavascriptInterface fun getVoiceSettings() = runOnUiThread { sendVoiceSettings() }
+        @JavascriptInterface fun saveVoiceSettings(name: String, rate: Double, preview: Boolean) = runOnUiThread {
+            if (!rate.isFinite() || !configureVoice(name, rate.toFloat().coerceIn(0.5f, 1.5f))) {
+                sendVoiceSettings("该离线音色不可用，设置未保存。请检查系统语音包。")
+            } else {
+                sendVoiceSettings("设置已保存。音色的自然度由系统语音引擎决定。")
+                if (preview) speakText("你好，这里是 InkDock。窗外的风轻轻吹过，我们继续读下一段故事。")
+            }
         }
+        @JavascriptInterface fun speak(value: String) = runOnUiThread { speakText(value) }
         @JavascriptInterface fun stopSpeaking() = runOnUiThread { tts?.stop() }
     }
     override fun onPause() { super.onPause(); tts?.stop() }
