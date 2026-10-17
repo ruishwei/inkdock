@@ -41,7 +41,9 @@ function updatePlayButton(active){playing=!!active;$('playIcon').toggleAttribute
 function readingStatus(message){$('playbackStatus').textContent=message;$('playbackStatus').hidden=!message;}
 function clearHighlight(){document.querySelectorAll('.speaking').forEach(el=>el.classList.remove('speaking'));}
 function cancelReading(){reading=null;clearHighlight();updatePlayButton(false);bridge?.stopSpeaking();}
+window.stopForEngineChange=()=>{cancelReading();readingStatus('切换语音引擎，朗读已停止。');};
 window.stopForBackground=()=>{cancelReading();readingStatus('应用进入后台，朗读已停止。');};
+function speechParts(text){return InkSpeech.splitText(text,$('speechSource').value==='offline'?2800:600);}
 function blockSpeech(index){const block=book.blocks[index];if(!block||['heading','code','hr','displayMath'].includes(block.token.type))return '';
  const holder=document.createElement('div');holder.innerHTML=safeHtml(block);holder.querySelectorAll('.katex').forEach(el=>el.replaceWith(document.createTextNode('（公式）')));
  const value=(holder.textContent||'').trim();return value.replace(/[（()）\s]/g,'')==='公式'?'':value;
@@ -50,7 +52,7 @@ function sendReadingPart(){
  const job=reading;if(!job)return;
  if(job.mode==='continuous'){
   while(job.part>=job.parts.length){if(job.nextBlock>=book.blocks.length){reading=null;clearHighlight();updatePlayButton(false);readingStatus(job.sent?'全文朗读完成。':'没有可朗读的正文段落；标题、纯公式和代码块会跳过。');return;}
-   job.block=job.nextBlock++;job.parts=InkSpeech.splitText(blockSpeech(job.block));job.part=0;
+   job.block=job.nextBlock++;job.parts=speechParts(blockSpeech(job.block));job.part=0;
   }
   if(Math.floor(job.block/40)!==page)render(job.block);
   current=job.block;clearHighlight();const element=document.getElementById(`p-${job.block}`);element?.classList.add('speaking');element?.scrollIntoView({block:'nearest'});persist();
@@ -63,7 +65,7 @@ $('speak').onclick=()=>{
  const captured=speakSelection;speakSelection='';
  if(playing){cancelReading();readingStatus('朗读已停止。');return;}
  const selected=(captured||window.getSelection()?.toString()||'').trim();
- reading=selected?{mode:'selection',parts:InkSpeech.splitText(selected),part:0}:{mode:'continuous',nextBlock:current,block:current,parts:[],part:0};sendReadingPart();
+ reading=selected?{mode:'selection',parts:speechParts(selected),part:0}:{mode:'continuous',nextBlock:current,block:current,parts:[],part:0};sendReadingPart();
 };
 window.onSpeechStatus=event=>{
  const job=reading;if(job&&event.requestId!==job.requestId)return;
@@ -84,20 +86,32 @@ function openPanel(id){cancelTap();closePanels();showToolbar(true);$(id).hidden=
 $('moreButton').onclick=()=>openPanel('morePanel');$('closeMore').onclick=closePanels;
 $('closeToc').onclick=closePanels;$('closeVoice').onclick=closePanels;
 $('voiceSettings').onclick=()=>{openPanel('voicePanel');bridge?.getVoiceSettings();};
+$('speechSource').onchange=()=>{cancelReading();bridge?.setSpeechSource($('speechSource').value);};
+$('cloudStop').onclick=()=>{cancelReading();readingStatus('云朗读已停止，已发送的请求可能已产生费用。');};
+$('configureCloud').onclick=()=>{cancelReading();bridge?.configureCloudVoice($('speechSource').value);};
+$('previewCloud').onclick=()=>{cancelReading();bridge?.previewCloudVoice();};
+$('switchEngine').onclick=()=>{cancelReading();bridge?.selectVoiceEngine($('engineChoice').value);};
 $('voiceRate').oninput=()=>{$('rateValue').textContent=Number($('voiceRate').value).toFixed(2)+'×';};
 function saveVoice(preview){cancelReading();bridge?.saveVoiceSettings($('voiceChoice').value,Number($('voiceRate').value),preview);}
 $('saveVoice').onclick=()=>saveVoice(false);$('previewVoice').onclick=()=>saveVoice(true);
 $('voiceStop').onclick=()=>{cancelReading();readingStatus('朗读已停止。');};
 window.setVoiceSettings=state=>{
+ $('speechSource').value=state.source||'offline';
+ const cloud=$('speechSource').value!=='offline';$('cloudControls').hidden=!cloud;$('offlineControls').hidden=cloud;
  $('voiceDiagnostics').textContent=state.diagnostics||'尚无朗读事件。';
- $('voiceEngine').textContent='系统默认引擎：'+(state.engine||'不可用');
+ $('engineChoice').replaceChildren();
+ const defaultEngine=document.createElement('option');defaultEngine.value='';defaultEngine.textContent='系统默认（重新检测）';$('engineChoice').append(defaultEngine);
+ for(const engine of state.engines||[]){const option=document.createElement('option');option.value=engine.name;option.textContent=engine.label+' · '+engine.name;$('engineChoice').append(option);}
+ $('engineChoice').value=state.enginePackage||'';
+ $('switchEngine').disabled=!bridge;
+ $('voiceEngine').textContent=(state.loading?'初始化中：':'请求使用引擎：')+(state.engine||'系统默认');
  $('voiceCurrent').textContent='当前语言 / 音色：'+(state.language||'未设置')+' / '+(state.current||'无可用音色');
  $('voiceChoice').replaceChildren();
  for(const voice of state.voices||[]){const option=document.createElement('option');option.value=voice.name;option.textContent=voice.language+' · '+voice.name;$('voiceChoice').append(option);}
  $('voiceChoice').value=state.current||'';
- const available=!!(state.voices?.length);$('voiceChoice').disabled=!available;$('saveVoice').disabled=!available;$('previewVoice').disabled=!available;
+ const available=!state.loading&&!!(state.voices?.length);$('voiceChoice').disabled=!available;$('saveVoice').disabled=!available;$('previewVoice').disabled=!available;
  $('voiceRate').value=state.rate||1;$('voiceRate').oninput();
- $('voiceStatus').textContent=state.message||(available?'仅列出引擎报告为已安装的离线中文音色。':'没有可用的离线中文音色，请在手机系统 TTS 设置中安装后重启应用。');
+ $('voiceStatus').textContent=state.message||(cloud?'实验性云 TTS：每段发送前会单独确认，真实音色尚未实测。':available?'仅列出引擎报告为已安装的离线中文音色。':'没有可用的离线中文音色，请在手机系统 TTS 设置中安装后重启应用。');
 };
 // Only a stationary, short tap toggles tools. Swipes never trigger actions.
 let tap=null,tapTimer,lastScroll=-Infinity,lastTap=-Infinity;
