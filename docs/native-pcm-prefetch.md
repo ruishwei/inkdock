@@ -1,5 +1,7 @@
 # Native one-next PCM prefetch experiment
 
+Historical alpha.7 whole-unit-buffer baseline. The independent streaming prototype now uses callback rings instead; see native-pcm-streaming.md. The baseline device results do not validate that streaming delta.
+
 Independent copy of the frozen native experiment. The original native/JNI build directory is not modified. No model download, real model inference, paid call, permission change, KVM access, or Android-device execution was performed for this implementation.
 
 ## Architecture and limits
